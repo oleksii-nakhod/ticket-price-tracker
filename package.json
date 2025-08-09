@@ -1,0 +1,20 @@
+{
+    "name": "ticket-prices-bot",
+    "version": "1.0.0",
+    "description": "Ticket Prices Tracking",
+    "main": "index.js",
+    "type": "module",
+    "dependencies": {
+        "node-telegram-bot-api": "^0.66.0",
+        "dotenv": "^17.2.1",
+        "lowdb": "^7.0.1",
+        "uuid": "^11.1.0",
+        "node-fetch-cookies": "^2.1.1",
+        "playwright": "^1.54.2",
+        "node-fetch": "^3.3.2",
+        "tough-cookie": "^5.1.2"
+    },
+    "scripts": {
+        "start": "node index.js"
+    }
+}

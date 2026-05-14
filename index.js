@@ -221,7 +221,7 @@ function formatEvent(event, includeDetails = false) {
         tags,
         attractions: attractionsList,
         price: priceInfo,
-        url: event.url || '#',
+        url: event.url || 'https://www.ticketmaster.ca',
     };
 
     if (includeDetails) {
@@ -281,19 +281,33 @@ bot.onText(/\/tracked/, async (msg) => {
     }
 
     let message = '*Your Tracked Tickets:*\n\n';
+    let index = 1;
+    const keyboard = { inline_keyboard: [] };
+    let row = [];
+
     for (const [eventId, targetPrice] of Object.entries(trackedTickets)) {
         const event = db.data.eventCache[eventId];
         if (!event) continue;
 
         const formatted = formatEvent(event);
-        message += `*${formatted.name}*\n`;
+        message += `${index}. *${formatted.name}*\n`;
         message += `   📅 *Date*: ${formatted.date}\n`;
-        message += `   🏟 *Venue*: ${formatted.venue}, ${formatted.city}\n`;
         message += `   💵 *Current Price*: ${formatted.price}\n`;
-        message += `   🎯 *Target Price*: ${targetPrice.toFixed(2)}\n\n`;
+        message += `   🎯 *Target Price*: $${targetPrice.toFixed(2)}\n\n`;
+        
+        row.push({ text: `Manage ${index}`, callback_data: `manage_${eventId}` });
+        if (row.length === 3) {
+            keyboard.inline_keyboard.push(row);
+            row = [];
+        }
+        index++;
     }
 
-    bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    if (row.length > 0) {
+        keyboard.inline_keyboard.push(row);
+    }
+
+    bot.sendMessage(chatId, message, { parse_mode: 'Markdown', reply_markup: keyboard });
 });
 
 // Handle /setcity with city name
@@ -313,15 +327,36 @@ bot.onText(/\/setcity$/, async (msg) => {
     const chatId = msg.chat.id;
     db.data.awaitingCity[chatId] = true;
     await db.write();
-    bot.sendMessage(chatId, 'Please type the city name:');
+    bot.sendMessage(chatId, 'Please type the city name:', {
+        reply_markup: { force_reply: true }
+    });
 });
 
-// Modified message handler to handle price input for tracking
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
 
-    if (text.startsWith('/')) return;
+    if (!text) return;
+
+    if (text.startsWith('/')) {
+        let stateChanged = false;
+        await db.read();
+        
+        if (db.data.awaitingCity && db.data.awaitingCity[chatId] && !text.startsWith('/setcity')) {
+            db.data.awaitingCity[chatId] = false;
+            stateChanged = true;
+        }
+        
+        if (db.data.awaitingPrice && db.data.awaitingPrice[chatId]) {
+            delete db.data.awaitingPrice[chatId];
+            stateChanged = true;
+        }
+
+        if (stateChanged) {
+            await db.write();
+        }
+        return;
+    }
 
     await db.read();
     db.data.awaitingCity = db.data.awaitingCity || {};
@@ -346,7 +381,7 @@ bot.on('message', async (msg) => {
             return;
         }
 
-        const { eventId } = db.data.awaitingPrice[chatId];
+        const { eventId, isUpdate } = db.data.awaitingPrice[chatId];
         const event = db.data.eventCache[eventId];
         if (!event) {
             bot.sendMessage(chatId, 'Error: Event data not found. Please try again.');
@@ -360,7 +395,8 @@ bot.on('message', async (msg) => {
         delete db.data.awaitingPrice[chatId];
         await db.write();
 
-        bot.sendMessage(chatId, `Now tracking *${event.name}*. You'll be notified when the price drops to ${price.toFixed(2)} or below.`, { parse_mode: 'Markdown' });
+        const actionText = isUpdate ? 'Target price updated for' : 'Now tracking';
+        bot.sendMessage(chatId, `${actionText} *${event.name}*. You'll be notified when the price drops to ${price.toFixed(2)} or below.`, { parse_mode: 'Markdown' });
         return;
     }
 
@@ -388,17 +424,24 @@ bot.on('message', async (msg) => {
 
         let message = '🎉 *Events found:*\n\n';
         const keyboard = { inline_keyboard: [] };
-        const onSaleEvents = events.filter(event => event.dates?.status?.code.toLowerCase() === 'onsale');
+        
+        // Filter out cancelled events and limit to 5 to avoid caption too long error
+        const validEvents = events
+            .filter(event => event.dates?.status?.code.toLowerCase() !== 'cancelled')
+            .slice(0, 5);
 
-        if (onSaleEvents.length === 0) {
-            bot.sendMessage(chatId, `No events currently on sale for "${text}" in ${city}.`);
+        if (validEvents.length === 0) {
+            bot.sendMessage(chatId, `No valid upcoming events found for "${text}" in ${city}.`);
             return;
         }
 
         // Fetch cheapest ticket prices in parallel
-        const pricePromises = onSaleEvents.map(async (event) => {
-            const eventDiscoveryId = event.url.split('/').pop();
-            const priceData = await getCheapestTicketPrice(eventDiscoveryId);
+        const pricePromises = validEvents.map(async (event) => {
+            let priceData = null;
+            if (event.url) {
+                const eventDiscoveryId = event.url.split('/').pop();
+                priceData = await getCheapestTicketPrice(eventDiscoveryId);
+            }
             event.cheapestPrice = priceData;
 
             // Cache event data
@@ -412,14 +455,14 @@ bot.on('message', async (msg) => {
         await Promise.all(pricePromises);
         await db.write();
 
-        onSaleEvents.forEach((event, index) => {
+        validEvents.forEach((event, index) => {
             const formatted = formatEvent(event);
             message += `${index + 1}. *${formatted.name}*\n\n    🎤 *Performing*: ${formatted.attractions}\n    📅 *Date*: ${formatted.date}\n    🏟 *Venue*: ${formatted.venue}, ${formatted.city}\n    💵 *Cheapest Ticket*: ${formatted.price}\n    🏷 *Tags*: ${formatted.tags}\n\n`;
             keyboard.inline_keyboard.push([{ text: `${index + 1}. ${formatted.name} - ${formatted.date} - ${formatted.price}`, callback_data: `view_${event.id}` }]);
         });
 
         // Add first image from the first event, if available
-        const firstEventImage = onSaleEvents[0]?.images?.[0]?.url;
+        const firstEventImage = validEvents[0]?.images?.[0]?.url;
         if (firstEventImage) {
             await bot.sendPhoto(chatId, firstEventImage, {
                 caption: message,
@@ -445,7 +488,7 @@ bot.on('callback_query', async (query) => {
     const data = query.data;
 
     if (data.startsWith('view_')) {
-        const eventId = data.split('_')[1];
+        const eventId = data.substring(data.indexOf('_') + 1);
 
         try {
             await db.read();
@@ -457,8 +500,11 @@ bot.on('callback_query', async (query) => {
                     `https://app.ticketmaster.com/discovery/v2/events/${eventId}?apikey=${ticketmasterApiKey}`
                 ).then(response => response.json());
 
-                const eventDiscoveryId = response.url.split('/').pop();
-                const priceData = await getCheapestTicketPrice(eventDiscoveryId);
+                let priceData = null;
+                if (response.url) {
+                    const eventDiscoveryId = response.url.split('/').pop();
+                    priceData = await getCheapestTicketPrice(eventDiscoveryId);
+                }
                 response.cheapestPrice = priceData;
 
                 // Cache the event
@@ -478,6 +524,11 @@ bot.on('callback_query', async (query) => {
             caption += `🏷 *Tags*: ${formatted.tags}\n`;
             caption += `\n📝 *Info*: ${formatted.info}\n`;
             caption += `⚠ *Please Note*: ${formatted.pleaseNote}`;
+
+            const MAX_CAPTION_LENGTH = 800; // Leave a little buffer for formatting tags
+            if (caption.length > MAX_CAPTION_LENGTH) {
+                caption = caption.substring(0, MAX_CAPTION_LENGTH) + '... (truncated)';
+            }
 
             const keyboard = {
                 inline_keyboard: [
@@ -508,13 +559,83 @@ bot.on('callback_query', async (query) => {
             bot.answerCallbackQuery(query.id);
         }
     } else if (data.startsWith('track_')) {
-        const eventId = data.split('_')[1];
+        const eventId = data.substring(data.indexOf('_') + 1);
         db.data.awaitingPrice = db.data.awaitingPrice || {};
         db.data.awaitingPrice[chatId] = { eventId };
         await db.write();
 
-        bot.sendMessage(chatId, 'Please enter your target price for tracking this event:');
+        bot.sendMessage(chatId, 'Please enter your target price for tracking this event:', {
+            reply_markup: { force_reply: true }
+        });
         bot.answerCallbackQuery(query.id);
+    } else if (data.startsWith('manage_')) {
+        const eventId = data.substring(data.indexOf('_') + 1);
+        await db.read();
+        const event = db.data.eventCache[eventId];
+        const targetPrice = db.data.trackedTickets[chatId]?.[eventId];
+        
+        if (!event || targetPrice === undefined) {
+            bot.sendMessage(chatId, 'This ticket is no longer being tracked or the event data is missing.');
+            bot.answerCallbackQuery(query.id);
+            return;
+        }
+
+        const formatted = formatEvent(event);
+        let message = `⚙️ *Managing Tracked Ticket:*\n\n`;
+        message += `*${formatted.name}*\n`;
+        message += `📅 *Date*: ${formatted.date}\n`;
+        message += `🏟 *Venue*: ${formatted.venue}, ${formatted.city}\n`;
+        message += `💵 *Current Price*: ${formatted.price}\n`;
+        message += `🎯 *Current Target*: $${targetPrice.toFixed(2)}\n`;
+
+        const keyboard = {
+            inline_keyboard: [
+                [
+                    { text: '✏️ Adjust Price', callback_data: `editprice_${eventId}` },
+                    { text: '❌ Stop Tracking', callback_data: `untrack_${eventId}` }
+                ],
+                [
+                    { text: '🎟️ Buy Tickets', url: formatted.url }
+                ]
+            ]
+        };
+
+        bot.sendMessage(chatId, message, { parse_mode: 'Markdown', reply_markup: keyboard });
+        bot.answerCallbackQuery(query.id);
+    } else if (data.startsWith('editprice_')) {
+        const eventId = data.substring(data.indexOf('_') + 1);
+        db.data.awaitingPrice = db.data.awaitingPrice || {};
+        db.data.awaitingPrice[chatId] = { eventId, isUpdate: true };
+        await db.write();
+
+        bot.sendMessage(chatId, 'Please enter your *new* target price for tracking this event:', { 
+            parse_mode: 'Markdown',
+            reply_markup: { force_reply: true }
+        });
+        bot.answerCallbackQuery(query.id);
+    } else if (data.startsWith('untrack_')) {
+        const eventId = data.substring(data.indexOf('_') + 1);
+        await db.read();
+        
+        if (db.data.trackedTickets[chatId] && db.data.trackedTickets[chatId][eventId] !== undefined) {
+            delete db.data.trackedTickets[chatId][eventId];
+            await db.write();
+            
+            const event = db.data.eventCache[eventId];
+            const eventName = event ? event.name : 'Unknown Event';
+            
+            try {
+                 bot.editMessageText(`❌ Stopped tracking *${eventName}*.`, {
+                     chat_id: chatId,
+                     message_id: query.message.message_id,
+                     parse_mode: 'Markdown'
+                 });
+            } catch (err) {
+                 bot.sendMessage(chatId, `❌ Stopped tracking *${eventName}*.`, { parse_mode: 'Markdown' });
+            }
+        }
+        
+        bot.answerCallbackQuery(query.id, { text: 'Ticket tracking stopped' });
     }
 });
 

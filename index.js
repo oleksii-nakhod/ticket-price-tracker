@@ -36,17 +36,17 @@ const token = process.env.TELEGRAM_BOT_TOKEN;
 const ticketmasterApiKey = process.env.TICKETMASTER_API_KEY;
 
 // Function to fetch tmpt cookie
-async function fetchTmptCookie() {
+async function fetchTmptCookie(force = false) {
     // Check if cookie exists and is not expired
     const COOKIE_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
     const currentTime = Date.now();
 
-    if (db.data.tmptCookie.value &&
+    if (!force && db.data.tmptCookie.value &&
         (currentTime - db.data.tmptCookie.timestamp < COOKIE_EXPIRY_MS)) {
-        console.log('Using existing valid tmpt cookie');
         return db.data.tmptCookie.value;
     }
 
+    console.log('Fetching fresh tmpt cookie using Playwright...');
     const browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -68,7 +68,7 @@ async function fetchTmptCookie() {
             const cookies = await context.cookies();
             tmptCookie = cookies.find(cookie => cookie.name === 'tmpt');
             if (tmptCookie) {
-                console.log('tmpt cookie found:', tmptCookie);
+                console.log('tmpt cookie found:', tmptCookie.value ? 'Yes' : 'No');
                 break;
             }
             await page.waitForTimeout(checkInterval);
@@ -96,8 +96,8 @@ async function fetchTmptCookie() {
 }
 
 // Function to get valid tmpt cookie
-async function getValidTmptCookie() {
-    return await fetchTmptCookie();
+async function getValidTmptCookie(force = false) {
+    return await fetchTmptCookie(force);
 }
 
 // Schedule periodic cookie refresh
@@ -109,6 +109,7 @@ setInterval(async () => {
 // Function to check tracked tickets
 async function checkTrackedTickets() {
     await db.read();
+    let totalChecked = 0;
 
     for (const [chatId, ticketIds] of Object.entries(db.data.trackedTickets)) {
         for (const [eventId, targetPrice] of Object.entries(ticketIds)) {
@@ -116,14 +117,28 @@ async function checkTrackedTickets() {
                 const event = db.data.eventCache[eventId];
                 if (!event) continue;
 
-                const eventDiscoveryId = event.url.split('/').pop();
-                const priceData = await getCheapestTicketPrice(eventDiscoveryId);
+                console.log(`[Tracker] Checking price for tracked event: ${event.name} (Target: $${targetPrice})`);
+
+                let priceData = null;
+                if (event.url) {
+                    const eventDiscoveryId = event.url.split('?')[0].split('/').pop();
+                    priceData = await getCheapestTicketPrice(eventDiscoveryId);
+                }
+                
+                totalChecked++;
 
                 if (priceData && priceData.price <= targetPrice && priceData.price < (event.cheapestPrice?.price || Infinity)) {
+                    const keyboard = {
+                        inline_keyboard: [
+                            [
+                                { text: '🎟️ Buy Tickets', url: event.url || 'https://www.ticketmaster.ca' }
+                            ]
+                        ]
+                    };
                     // Send notification to user
                     await bot.sendMessage(chatId,
-                        `🎉 Price alert! The cheapest ticket for *${event.name}* is now *${priceData.currency} ${priceData.price.toFixed(2)}* (Section: ${priceData.section}), which is below your target of *${targetPrice.toFixed(2)}*!`,
-                        { parse_mode: 'Markdown' }
+                        `🎉 *${event.name}* - Price Alert!\n\nThe cheapest ticket is now *${priceData.currency} ${priceData.price.toFixed(2)}* (Section: ${priceData.section}), which is below your target of *$${targetPrice.toFixed(2)}*!`,
+                        { parse_mode: 'Markdown', reply_markup: keyboard }
                     );
                 }
 
@@ -133,19 +148,23 @@ async function checkTrackedTickets() {
                     await db.write();
                 }
             } catch (error) {
-                console.error(`Error checking price for event ${eventId}:`, error.message);
+                console.error(`[Tracker] Error checking price for event ${eventId}:`, error.message);
             }
         }
     }
+    
+    if (totalChecked > 0) {
+        console.log(`[Tracker] Completed checking ${totalChecked} tracked tickets.`);
+    }
 }
 
-// Schedule price checks every 5 minutes
-setInterval(checkTrackedTickets, 5 * 60 * 1000);
+// Schedule price checks every 3 minutes
+setInterval(checkTrackedTickets, 3 * 60 * 1000);
 
 const bot = new TelegramBot(token, { polling: true });
 
 // Modified function to fetch cheapest ticket price
-async function getCheapestTicketPrice(eventId) {
+async function getCheapestTicketPrice(eventId, retryCount = 0) {
     try {
         const tmptCookie = await getValidTmptCookie();
         if (!tmptCookie) {
@@ -153,27 +172,54 @@ async function getCheapestTicketPrice(eventId) {
             return null;
         }
 
-        const response = await fetch(
-            `https://offeradapter.ticketmaster.ca/api/ismds/event/${eventId}/quickpicks?` + new URLSearchParams({
-                show: 'places+maxQuantity+sections',
-                mode: 'primary:ppsectionrow+resale:ga_areas+platinum:all',
-                qty: 1,
-                q: 'not(\'accessible\')',
-                embed: 'offer',
-                apikey: process.env.TICKETMASTER_PUBLIC_API_KEY,
-                apisecret: process.env.TICKETMASTER_PUBLIC_API_SECRET,
-                limit: 40,
-                offset: 0,
-                sort: 'noTaxTotalprice'
-            }),
-            {
-                headers: {
-                    'Referer': 'https://www.ticketmaster.ca/',
-                    'TMPS-Correlation-Id': uuidv4(),
-                    'Cookie': tmptCookie
+        const url = `https://offeradapter.ticketmaster.ca/api/ismds/event/${eventId}/quickpicks?` + new URLSearchParams({
+            show: 'places+maxQuantity+sections',
+            mode: 'primary:ppsectionrow+resale:ga_areas+platinum:all',
+            qty: 1,
+            q: 'not(\'accessible\')',
+            embed: 'offer',
+            apikey: process.env.TICKETMASTER_PUBLIC_API_KEY,
+            apisecret: process.env.TICKETMASTER_PUBLIC_API_SECRET,
+            limit: 40,
+            offset: 0,
+            sort: 'noTaxTotalprice'
+        });
+
+        const res = await fetch(url, {
+            headers: {
+                'Referer': 'https://www.ticketmaster.ca/',
+                'TMPS-Correlation-Id': uuidv4(),
+                'Cookie': tmptCookie
+            }
+        });
+
+        if (res.status === 401 || res.status === 403) {
+            if (retryCount < 1) {
+                console.log(`Received status ${res.status} for event ${eventId}. Refreshing cookie and retrying...`);
+                await getValidTmptCookie(true);
+                return await getCheapestTicketPrice(eventId, retryCount + 1);
+            } else {
+                console.error(`Received status ${res.status} for event ${eventId} on retry.`);
+                return null;
+            }
+        }
+
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json') && !contentType.includes('application/hal+json')) {
+            const text = await res.text();
+            if (text.trim().startsWith('<') || res.status !== 200) {
+                if (retryCount < 1) {
+                    console.log(`Received HTML/non-JSON response (status ${res.status}) for event ${eventId}. Refreshing cookie and retrying...`);
+                    await getValidTmptCookie(true);
+                    return await getCheapestTicketPrice(eventId, retryCount + 1);
+                } else {
+                    console.error(`Received HTML/non-JSON response (status ${res.status}) for event ${eventId} on retry.`);
+                    return null;
                 }
             }
-        ).then(res => res.json());
+        }
+
+        const response = await res.json();
         const offers = response._embedded?.offer || [];
 
         if (offers.length === 0) return null;
@@ -191,6 +237,11 @@ async function getCheapestTicketPrice(eventId) {
             section: cheapestOffer.section
         } : null;
     } catch (error) {
+        if (retryCount < 1 && (error.message.includes('Unexpected token') || error.message.includes('JSON'))) {
+            console.log(`JSON parsing failed for event ${eventId}. Refreshing cookie and retrying...`);
+            await getValidTmptCookie(true);
+            return await getCheapestTicketPrice(eventId, retryCount + 1);
+        }
         console.error(`Error fetching ticket price for event ${eventId}:`, error.message);
         return null;
     }
@@ -411,9 +462,25 @@ bot.on('message', async (msg) => {
     const encodedCity = encodeURIComponent(city);
 
     try {
-        const response = await fetch(
-            `https://app.ticketmaster.com/discovery/v2/events?apikey=${ticketmasterApiKey}&city=${encodedCity}&keyword=${keyword}`
-        ).then(response => response.json());
+        let geoPointParam = '';
+        try {
+            const geoResponse = await fetch(
+                `https://geocoding-api.open-meteo.com/v1/search?name=${encodedCity}&count=1&language=en&format=json`
+            ).then(res => res.json());
+            if (geoResponse.results && geoResponse.results.length > 0) {
+                const loc = geoResponse.results[0];
+                geoPointParam = `&geoPoint=${loc.latitude},${loc.longitude}&radius=30&unit=miles`;
+                console.log(`Geocoded "${city}" to latitude: ${loc.latitude}, longitude: ${loc.longitude}. Searching within 30 miles.`);
+            }
+        } catch (geoError) {
+            console.error('Geocoding error:', geoError.message);
+        }
+
+        const url = geoPointParam
+            ? `https://app.ticketmaster.com/discovery/v2/events?apikey=${ticketmasterApiKey}&keyword=${keyword}${geoPointParam}`
+            : `https://app.ticketmaster.com/discovery/v2/events?apikey=${ticketmasterApiKey}&city=${encodedCity}&keyword=${keyword}`;
+
+        const response = await fetch(url).then(response => response.json());
 
         const events = response._embedded?.events || [];
 
@@ -425,10 +492,10 @@ bot.on('message', async (msg) => {
         let message = '🎉 *Events found:*\n\n';
         const keyboard = { inline_keyboard: [] };
         
-        // Filter out cancelled events and limit to 5 to avoid caption too long error
+        // Filter out cancelled events and limit to 10
         const validEvents = events
             .filter(event => event.dates?.status?.code.toLowerCase() !== 'cancelled')
-            .slice(0, 5);
+            .slice(0, 10);
 
         if (validEvents.length === 0) {
             bot.sendMessage(chatId, `No valid upcoming events found for "${text}" in ${city}.`);
@@ -439,7 +506,7 @@ bot.on('message', async (msg) => {
         const pricePromises = validEvents.map(async (event) => {
             let priceData = null;
             if (event.url) {
-                const eventDiscoveryId = event.url.split('/').pop();
+                const eventDiscoveryId = event.url.split('?')[0].split('/').pop();
                 priceData = await getCheapestTicketPrice(eventDiscoveryId);
             }
             event.cheapestPrice = priceData;
@@ -463,13 +530,20 @@ bot.on('message', async (msg) => {
 
         // Add first image from the first event, if available
         const firstEventImage = validEvents[0]?.images?.[0]?.url;
-        if (firstEventImage) {
+        if (firstEventImage && message.length <= 950) {
             await bot.sendPhoto(chatId, firstEventImage, {
                 caption: message,
                 parse_mode: 'Markdown',
                 reply_markup: keyboard
             });
         } else {
+            if (firstEventImage) {
+                try {
+                    await bot.sendPhoto(chatId, firstEventImage);
+                } catch (photoError) {
+                    console.error('Error sending photo:', photoError.message);
+                }
+            }
             await bot.sendMessage(chatId, message, {
                 parse_mode: 'Markdown',
                 reply_markup: keyboard
@@ -502,7 +576,7 @@ bot.on('callback_query', async (query) => {
 
                 let priceData = null;
                 if (response.url) {
-                    const eventDiscoveryId = response.url.split('/').pop();
+                    const eventDiscoveryId = response.url.split('?')[0].split('/').pop();
                     priceData = await getCheapestTicketPrice(eventDiscoveryId);
                 }
                 response.cheapestPrice = priceData;
@@ -516,18 +590,32 @@ bot.on('callback_query', async (query) => {
 
             const formatted = formatEvent(event, true);
 
+            let infoText = formatted.info || 'No additional info available';
+            if (infoText.length > 250) {
+                infoText = infoText.substring(0, 250) + '...';
+            }
+            let pleaseNoteText = formatted.pleaseNote || 'No special notes';
+            if (pleaseNoteText.length > 150) {
+                pleaseNoteText = pleaseNoteText.substring(0, 150) + '...';
+            }
+
             let caption = `*${formatted.name}*\n\n`;
             caption += `🎤 *Performing*: ${formatted.attractions}\n`;
             caption += `📅 *Date*: ${formatted.date}\n`;
             caption += `🏟 *Venue*: ${formatted.venue}, ${formatted.city}\n`;
             caption += `💵 *Cheapest Ticket*: ${formatted.price}\n`;
             caption += `🏷 *Tags*: ${formatted.tags}\n`;
-            caption += `\n📝 *Info*: ${formatted.info}\n`;
-            caption += `⚠ *Please Note*: ${formatted.pleaseNote}`;
+            caption += `\n📝 *Info*: ${infoText}\n`;
+            caption += `⚠ *Please Note*: ${pleaseNoteText}`;
 
-            const MAX_CAPTION_LENGTH = 800; // Leave a little buffer for formatting tags
+            const MAX_CAPTION_LENGTH = 950;
             if (caption.length > MAX_CAPTION_LENGTH) {
-                caption = caption.substring(0, MAX_CAPTION_LENGTH) + '... (truncated)';
+                caption = caption.substring(0, MAX_CAPTION_LENGTH);
+                const asteriskCount = (caption.match(/\*/g) || []).length;
+                if (asteriskCount % 2 !== 0) {
+                    caption += '*';
+                }
+                caption += '... (truncated)';
             }
 
             const keyboard = {
@@ -644,9 +732,12 @@ bot.on('polling_error', (error) => {
 });
 
 // Initial cookie fetch and price check on startup
-Promise.all([
-    fetchTmptCookie(),
-    checkTrackedTickets()
-]).then(() => {
-    console.log('Bot is running...');
-});
+(async () => {
+    try {
+        await fetchTmptCookie();
+        await checkTrackedTickets();
+        console.log('Bot is running...');
+    } catch (error) {
+        console.error('Error during startup initialization:', error);
+    }
+})();

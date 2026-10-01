@@ -4,7 +4,7 @@ import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { v4 as uuidv4 } from 'uuid';
+import { spawn } from 'child_process';
 import { chromium } from 'playwright';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -16,7 +16,7 @@ const defaultData = {
     userCities: {},
     awaitingCity: {},
     eventCache: {},
-    tmptCookies: {}, // site ('ticketmaster.ca' / 'ticketmaster.com') -> { value, timestamp }
+    siteBlocks: {}, // site -> { level, until }, price requests to a site that blocked us are paused until `until`
     trackedTickets: {}, // chatId -> eventId -> { targetPrice, quantity, lastPrice, lastCheckedAt, alertedPrice }
     trackerHealth: {} // chatId -> { failedCycles, failingSince, lastError, notifiedAt }, only while its checks fail
 };
@@ -31,10 +31,12 @@ db.data = db.data || defaultData;
 db.data.userCities = db.data.userCities || {};
 db.data.awaitingCity = db.data.awaitingCity || {};
 db.data.eventCache = db.data.eventCache || {};
-db.data.tmptCookies = db.data.tmptCookies || {};
+db.data.siteBlocks = db.data.siteBlocks || {};
 db.data.trackedTickets = db.data.trackedTickets || {};
 db.data.trackerHealth = db.data.trackerHealth || {};
-delete db.data.tmptCookie; // replaced by per-site tmptCookies
+// Prices are read from the event page now, so the API cookies aren't needed
+delete db.data.tmptCookie;
+delete db.data.tmptCookies;
 
 // Tracker health used to be one record shared by all chats, and every chat with tracked tickets was notified
 if ('failedCycles' in db.data.trackerHealth) {
@@ -75,12 +77,29 @@ process.on('unhandledRejection', (error) => {
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const ticketmasterApiKey = process.env.TICKETMASTER_API_KEY;
 
-const COOKIE_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
-// While Ticketmaster blocks us every request fails, and launching a browser for each one
-// exhausted the container (EAGAIN / launch timeouts), so refetch at most this often per site
-const COOKIE_REFETCH_COOLDOWN_MS = 10 * 60 * 1000;
-const lastCookieFetchAt = {};
-const pendingCookieFetches = {};
+// Ticketmaster blocks headless and Playwright-launched browsers, and its event pages no longer use the
+// price API we called, so prices are read off the event page in a normally started Chrome window
+// (on a server, inside a virtual display) that the bot attaches to. Its profile keeps the cookies
+// that show Ticketmaster we're a returning visitor.
+const CHROME_PATH = process.env.CHROME_PATH || {
+    win32: 'C:/Program Files/Google/Chrome/Application/chrome.exe',
+    darwin: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+}[process.platform] || '/opt/google/chrome/chrome';
+const CHROME_PROFILE_DIR = process.env.CHROME_PROFILE_DIR || join(__dirname, 'chrome-profile');
+const CHROME_DEBUG_PORT = Number(process.env.CHROME_DEBUG_PORT) || 9333;
+const PAGE_LOAD_TIMEOUT_MS = 60 * 1000;
+let chromeSession = null; // Promise of { chrome, browser, page } while Chrome is running
+let chromeProcess = null;
+
+// Hammering Ticketmaster while it blocks us keeps the block going, so a block pauses all price
+// requests to that site, for twice as long each time it's still blocked when the pause ends
+const BLOCK_PAUSE_MS = 30 * 60 * 1000;
+const MAX_BLOCK_PAUSE_MS = 6 * 60 * 60 * 1000;
+
+// Event pages are loaded one at a time in the one tab, with a random gap, like someone clicking through them
+const MIN_REQUEST_GAP_MS = 5000;
+const MAX_REQUEST_GAP_MS = 15000;
+let pageQueue = Promise.resolve();
 
 class TicketmasterBlockedError extends Error {}
 
@@ -99,80 +118,77 @@ function canCheckPrice(event) {
     }
 }
 
-// Function to fetch tmpt cookie by loading an event page of the given site
-async function fetchTmptCookie(eventUrl, site) {
-    console.log(`Fetching fresh tmpt cookie for ${site} using Playwright...`);
-    let browser;
+// Chrome is started once and reused, like a browser left open, and restarted if it closes or crashes
+function getTicketmasterPage() {
+    chromeSession = chromeSession || startChrome().catch(error => {
+        chromeSession = null;
+        throw error;
+    });
+    return chromeSession.then(({ page }) => page);
+}
+
+async function startChrome() {
+    console.log(`Starting Chrome (${CHROME_PATH}) for Ticketmaster price checks...`);
+    const args = [
+        `--remote-debugging-port=${CHROME_DEBUG_PORT}`,
+        `--user-data-dir=${CHROME_PROFILE_DIR}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--window-size=1400,1000'
+    ];
+    if (process.platform === 'linux') {
+        // Docker's /dev/shm is too small for Chrome, and its sandbox can't run as root
+        args.push('--disable-dev-shm-usage');
+        if (process.getuid?.() === 0) args.push('--no-sandbox');
+    }
+    const chrome = chromeProcess = spawn(CHROME_PATH, [...args, 'about:blank'], { stdio: 'ignore' });
+    const exited = new Promise((resolve, reject) => {
+        chrome.once('error', reject);
+        chrome.once('exit', resolve);
+    });
+    chrome.once('exit', () => {
+        console.log('Chrome closed; it will be restarted for the next price check.');
+        chromeSession = null;
+    });
 
     try {
-        browser = await chromium.launch({ headless: true });
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            locale: 'en-US',
-            viewport: { width: 1280, height: 720 },
-        });
-        const page = await context.newPage();
-        await page.goto(eventUrl, { waitUntil: 'domcontentloaded' });
-
-        let tmptCookie = null;
-        const maxWaitTime = 30000;
-        const checkInterval = 500;
-        const startTime = Date.now();
-
-        while (Date.now() - startTime < maxWaitTime) {
-            const cookies = await context.cookies();
-            tmptCookie = cookies.find(cookie => cookie.name === 'tmpt');
-            if (tmptCookie) {
-                console.log('tmpt cookie found:', tmptCookie.value ? 'Yes' : 'No');
-                break;
+        let browser;
+        const deadline = Date.now() + 30 * 1000;
+        while (!browser) {
+            try {
+                browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+            } catch (error) {
+                if (Date.now() > deadline) throw new Error(`Couldn't connect to Chrome: ${error.message}`);
+                // Chrome failing to start shows up here instead of as a connection timeout
+                await Promise.race([exited.then(code => {
+                    throw new Error(`Chrome exited during startup (code ${code})`);
+                }), new Promise(resolve => setTimeout(resolve, 500))]);
             }
-            await page.waitForTimeout(checkInterval);
         }
-
-        if (!tmptCookie) {
-            console.error('tmpt cookie was not found within the timeout period');
-            return null;
-        }
-
-        const cookieValue = `${tmptCookie.name}=${tmptCookie.value}`;
-        db.data.tmptCookies[site] = {
-            value: cookieValue,
-            timestamp: Date.now()
-        };
-        await db.write();
-        return cookieValue;
-
+        const context = browser.contexts()[0];
+        const page = context.pages()[0] || await context.newPage();
+        return { chrome, browser, page };
     } catch (error) {
-        console.error('Error fetching tmpt cookie:', error.message);
-        return null;
-    } finally {
-        await browser?.close().catch(() => {});
+        chrome.kill();
+        throw error;
     }
 }
 
-// Function to get valid tmpt cookie for the event's site
-async function getValidTmptCookie(eventUrl, force = false) {
-    const site = ticketmasterSite(eventUrl);
-    const cached = db.data.tmptCookies[site];
-
-    if (!force && cached?.value && (Date.now() - cached.timestamp < COOKIE_EXPIRY_MS)) {
-        return cached.value;
-    }
-    // Concurrent lookups (e.g. a search's parallel price fetches) share one browser launch
-    if (pendingCookieFetches[site]) {
-        return pendingCookieFetches[site];
-    }
-    if (Date.now() - (lastCookieFetchAt[site] || 0) < COOKIE_REFETCH_COOLDOWN_MS) {
-        return cached?.value || null;
-    }
-
-    lastCookieFetchAt[site] = Date.now();
-    pendingCookieFetches[site] = fetchTmptCookie(eventUrl, site)
-        .finally(() => delete pendingCookieFetches[site]);
-    return pendingCookieFetches[site];
+// Otherwise Chrome outlives the bot and holds on to the profile and debugging port
+function stopChrome() {
+    chromeProcess?.kill();
+}
+process.on('exit', stopChrome);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => {
+        stopChrome();
+        process.exit(0);
+    });
 }
 
-const HEALTH_ALERT_AFTER_FAILED_CYCLES = 2; // ~6 minutes, so a single blip doesn't alert
+// Every 3 minutes (~260 requests an hour for 13 events) got this server blocked
+const CHECK_INTERVAL_MS = 15 * 60 * 1000;
+const HEALTH_ALERT_AFTER_FAILED_CYCLES = 2; // ~30 minutes, so a single blip doesn't alert
 const HEALTH_REMINDER_MS = 24 * 60 * 60 * 1000;
 let isCheckingTickets = false;
 
@@ -184,6 +200,8 @@ async function checkTrackedTickets() {
 
     // Once a site blocks us, don't keep hammering it for the rest of this cycle
     const blockedSites = new Map(); // site -> TicketmasterBlockedError
+    // Chats tracking the same event and quantity share one request
+    const priceRequests = new Map(); // `${url}|${quantity}` -> Promise of price data
 
     try {
         for (const [chatId, tickets] of Object.entries(db.data.trackedTickets)) {
@@ -209,7 +227,11 @@ async function checkTrackedTickets() {
 
                 let priceData;
                 try {
-                    priceData = await getCheapestTicketPrice(event.url, ticket.quantity);
+                    const key = `${event.url}|${ticket.quantity}`;
+                    if (!priceRequests.has(key)) {
+                        priceRequests.set(key, getCheapestTicketPrice(event.url, ticket.quantity));
+                    }
+                    priceData = await priceRequests.get(key);
                 } catch (error) {
                     console.error(`[Tracker] Error checking price for event ${eventId}:`, error.message);
                     failedEvents.push(event);
@@ -322,96 +344,117 @@ async function updateTrackerHealth(chatId, attempted, failedEvents, lastError) {
     await db.write();
 }
 
-// Schedule price checks every 3 minutes
-setInterval(checkTrackedTickets, 3 * 60 * 1000);
+setInterval(checkTrackedTickets, CHECK_INTERVAL_MS);
 
 const bot = new TelegramBot(token, { polling: true });
 
-// Fetch the cheapest offer that can be bought in the given quantity (price is per ticket).
-// Returns null when no such tickets are available; throws when the price couldn't be checked.
-async function getCheapestTicketPrice(eventUrl, quantity = 1, retryCount = 0) {
+// Throws instead of sending anything while requests to the site are paused after a block
+function assertSiteNotPaused(site) {
+    const block = db.data.siteBlocks[site];
+    if (block && Date.now() < block.until) {
+        throw new TicketmasterBlockedError(`Ticketmaster blocked requests to ${site}; price checks are paused until ${new Date(block.until).toUTCString()}`);
+    }
+}
+
+async function pauseBlockedSite(site) {
+    const previous = db.data.siteBlocks[site];
+    const level = previous ? previous.level + 1 : 0;
+    const pauseMs = Math.min(BLOCK_PAUSE_MS * 2 ** level, MAX_BLOCK_PAUSE_MS);
+    db.data.siteBlocks[site] = { level, until: Date.now() + pauseMs };
+    await db.write();
+    console.warn(`Ticketmaster blocked ${site}. Pausing price checks for ${Math.round(pauseMs / 60000)} minutes.`);
+}
+
+// Runs task(page) once the checks queued before it are done, MIN..MAX_REQUEST_GAP_MS after the last one
+function withTicketmasterPage(task) {
+    const run = pageQueue.then(async () => task(await getTicketmasterPage()));
+    const gap = MIN_REQUEST_GAP_MS + Math.random() * (MAX_REQUEST_GAP_MS - MIN_REQUEST_GAP_MS);
+    pageQueue = run.catch(() => {}).then(() => new Promise(resolve => setTimeout(resolve, gap)));
+    return run;
+}
+
+// Cheapest listing that can be bought in the given quantity, as the event page shows it (price is per ticket,
+// fees included). Returns null when no such tickets are available; throws when the price couldn't be checked.
+async function getCheapestTicketPrice(eventUrl, quantity = 1) {
     const site = ticketmasterSite(eventUrl);
     if (!site) {
         throw new Error(`Price checks aren't supported for ${new URL(eventUrl).hostname}`);
     }
-    const eventId = eventUrl.split('?')[0].split('/').pop();
+    assertSiteNotPaused(site);
 
+    return withTicketmasterPage(async (page) => {
+        // A check ahead in the queue may have been blocked
+        assertSiteNotPaused(site);
+
+        await page.goto(eventUrl, { waitUntil: 'domcontentloaded', timeout: PAGE_LOAD_TIMEOUT_MS });
+        let state = await waitForListings(page, eventUrl);
+        if (state === 'blocked') {
+            const title = await page.title();
+            await pauseBlockedSite(site);
+            throw new TicketmasterBlockedError(`Ticketmaster stopped showing event pages on ${site} ("${title}")`);
+        }
+        if (db.data.siteBlocks[site]) {
+            console.log(`Ticketmaster is showing ${site} again.`);
+            delete db.data.siteBlocks[site];
+            await db.write();
+        }
+        if (state === 'none') return null;
+
+        // The page ignores a quantity in the URL and starts at the last one picked (2 at first)
+        const quantityButton = page.getByRole('button', { name: /current quantity/i }).first();
+        const currentQuantity = Number((await quantityButton.textContent()).match(/current quantity: (\d+)/i)?.[1]);
+        if (currentQuantity !== quantity) {
+            await quantityButton.click();
+            const option = page.getByRole('radio', { name: new RegExp(`^Set quantity to: ${quantity} Tickets?$`) });
+            if (await option.count() === 0) {
+                // Can't be bought in one order, e.g. a limit of 4 tickets per order
+                await page.keyboard.press('Escape');
+                return null;
+            }
+            await option.click();
+            await page.waitForFunction(
+                (quantity) => [...document.querySelectorAll('button')].some(b => b.textContent.includes(`current quantity: ${quantity} `)),
+                quantity, { timeout: 10000 });
+            // Give the list time to re-render for the new quantity
+            await page.waitForTimeout(2000);
+            state = await waitForListings(page, eventUrl);
+            if (state !== 'listings') return null;
+        }
+
+        const listings = await page.$$eval('#list-view li[data-listing-id]', items => items.map(item => ({
+            price: [...item.querySelectorAll('*')]
+                .find(e => e.children.length === 0 && /^[A-Z]{0,2}\$\s?[\d,]+(\.\d{2})?$/.test(e.textContent.trim()))
+                ?.textContent.trim(),
+            // "General Admission - Floor", "Sec 112 • Row 4", ...
+            section: item.innerText.split('\n')[0].trim()
+        })));
+        const offers = listings.filter(listing => listing.price).map(listing => ({
+            price: Number(listing.price.replace(/[^\d.]/g, '')),
+            currency: /^CA/.test(listing.price) ? 'CAD' : /^US/.test(listing.price) ? 'USD' : site === 'ticketmaster.ca' ? 'CAD' : 'USD',
+            section: listing.section
+        }));
+        if (offers.length === 0) {
+            throw new Error(`Couldn't read any prices from the event page ${eventUrl}`);
+        }
+        return offers.reduce((min, offer) => offer.price < min.price ? offer : min);
+    });
+}
+
+// What the event page settled on: 'listings', 'none' (sold out / no tickets) or 'blocked'. Ticketmaster's
+// bot check answers the first load with a 401 and reloads the page once it passes, so this polls.
+async function waitForListings(page, eventUrl) {
     try {
-        // A retry means the previous response was rejected, so ask for a fresh cookie
-        const tmptCookie = await getValidTmptCookie(eventUrl, retryCount > 0);
-        if (!tmptCookie) {
-            throw new Error(`No valid tmpt cookie available for ${site}`);
-        }
-
-        // US events are only served by the .com API; the .ca one returns no offers for them
-        const url = `https://offeradapter.${site}/api/ismds/event/${eventId}/quickpicks?` + new URLSearchParams({
-            show: 'places+maxQuantity+sections',
-            mode: 'primary:ppsectionrow+resale:ga_areas+platinum:all',
-            qty: quantity,
-            q: 'not(\'accessible\')',
-            embed: 'offer',
-            apikey: process.env.TICKETMASTER_PUBLIC_API_KEY,
-            apisecret: process.env.TICKETMASTER_PUBLIC_API_SECRET,
-            limit: 40,
-            offset: 0,
-            sort: 'noTaxTotalprice'
-        });
-
-        const res = await fetch(url, {
-            headers: {
-                'Referer': `https://www.${site}/`,
-                'TMPS-Correlation-Id': uuidv4(),
-                'Cookie': tmptCookie
-            }
-        });
-
-        if (res.status === 401 || res.status === 403) {
-            if (retryCount < 1) {
-                console.log(`Received status ${res.status} for event ${eventId}. Refreshing cookie and retrying...`);
-                return await getCheapestTicketPrice(eventUrl, quantity, retryCount + 1);
-            }
-            const body = await res.text();
-            throw new TicketmasterBlockedError(`Received status ${res.status} for event ${eventId} on retry: ${body.slice(0, 100)}`);
-        }
-
-        const contentType = res.headers.get('content-type') || '';
-        if (!contentType.includes('application/json') && !contentType.includes('application/hal+json')) {
-            const text = await res.text();
-            if (text.trim().startsWith('<') || res.status !== 200) {
-                if (retryCount < 1) {
-                    console.log(`Received HTML/non-JSON response (status ${res.status}) for event ${eventId}. Refreshing cookie and retrying...`);
-                    return await getCheapestTicketPrice(eventUrl, quantity, retryCount + 1);
-                }
-                throw new Error(`Received HTML/non-JSON response (status ${res.status}) for event ${eventId} on retry`);
-            }
-        }
-
-        if (!res.ok) {
-            throw new Error(`Received status ${res.status} for event ${eventId}`);
-        }
-
-        const response = await res.json();
-        const offers = response._embedded?.offer || [];
-
-        // Offers that can't be split down to exactly this quantity (e.g. a pair sold together) are excluded
-        const validOffers = offers.filter(offer => offer.sellableQuantities?.includes(quantity));
-
-        if (validOffers.length === 0) return null;
-
-        const cheapestOffer = validOffers.reduce((min, offer) =>
-            (!min || offer.totalPrice < min.totalPrice) ? offer : min, null);
-
-        return {
-            price: cheapestOffer.totalPrice,
-            currency: cheapestOffer.currency,
-            section: cheapestOffer.section
-        };
+        const state = await page.waitForFunction(() => {
+            if (/browsing activity has been paused/i.test(document.title)) return 'blocked';
+            if (document.querySelector('#list-view li[data-listing-id]')) return 'listings';
+            const text = document.body?.innerText || '';
+            if (/tickets are sold out|no tickets|no results|\b0 results/i.test(text)) return 'none';
+            return false;
+        }, null, { timeout: PAGE_LOAD_TIMEOUT_MS, polling: 500 });
+        return await state.jsonValue();
     } catch (error) {
-        if (retryCount < 1 && (error.message.includes('Unexpected token') || error.message.includes('JSON'))) {
-            console.log(`JSON parsing failed for event ${eventId}. Refreshing cookie and retrying...`);
-            return await getCheapestTicketPrice(eventUrl, quantity, retryCount + 1);
-        }
-        throw error;
+        if (error.name !== 'TimeoutError') throw error;
+        throw new Error(`The event page didn't show any listings within ${PAGE_LOAD_TIMEOUT_MS / 1000}s: ${eventUrl} ("${await page.title()}")`);
     }
 }
 
@@ -482,9 +525,12 @@ function formatEvent(event, includeDetails = false) {
     ].filter(tag => tag && tag !== 'Undefined').join(', ') : 'No tags available';
     const attractions = event._embedded?.attractions || [];
     const attractionsList = attractions.map(attraction => attraction.name).join(', ') || 'No attractions listed';
-    const priceInfo = event.cheapestPrice ?
-        `${event.cheapestPrice.currency} ${event.cheapestPrice.price.toFixed(2)} (${event.cheapestPrice.section})` :
-        'Price not available';
+    // Face value from the Discovery API: a live price means loading the event page, which takes too long
+    // for every search result, so only tracked tickets get one
+    const range = event.priceRanges?.[0];
+    const priceInfo = !range ? 'See Ticketmaster' :
+        range.max > range.min ? `${range.currency} ${range.min.toFixed(2)} - ${range.max.toFixed(2)} (face value)` :
+        `${range.currency} ${range.min.toFixed(2)} (face value)`;
 
     let result = {
         name: eventName,
@@ -730,31 +776,14 @@ bot.on('message', async (msg) => {
             return;
         }
 
-        // Fetch cheapest ticket prices in parallel
-        const pricePromises = validEvents.map(async (event) => {
-            let priceData = null;
-            if (event.url) {
-                priceData = await getCheapestTicketPrice(event.url).catch(error => {
-                    console.error(`Error fetching ticket price for event ${event.id}:`, error.message);
-                    return null;
-                });
-            }
-            event.cheapestPrice = priceData;
-
-            // Cache event data
-            db.data.eventCache[event.id] = {
-                ...event,
-                cheapestPrice: priceData
-            };
-            return event;
-        });
-
-        await Promise.all(pricePromises);
+        for (const event of validEvents) {
+            db.data.eventCache[event.id] = event;
+        }
         await db.write();
 
         validEvents.forEach((event, index) => {
             const formatted = formatEvent(event);
-            message += html`${index + 1}. <b>${formatted.name}</b>\n\n    🎤 <b>Performing</b>: ${formatted.attractions}\n    📅 <b>Date</b>: ${formatted.date}\n    🏟 <b>Venue</b>: ${formatted.venue}, ${formatted.city}\n    💵 <b>Cheapest Ticket</b>: ${formatted.price}\n    🏷 <b>Tags</b>: ${formatted.tags}\n\n`;
+            message += html`${index + 1}. <b>${formatted.name}</b>\n\n    🎤 <b>Performing</b>: ${formatted.attractions}\n    📅 <b>Date</b>: ${formatted.date}\n    🏟 <b>Venue</b>: ${formatted.venue}, ${formatted.city}\n    💵 <b>Price</b>: ${formatted.price}\n    🏷 <b>Tags</b>: ${formatted.tags}\n\n`;
             keyboard.inline_keyboard.push([{ text: `${index + 1}. ${formatted.name} - ${formatted.date} - ${formatted.price}`, callback_data: `view_${event.id}` }]);
         });
 
@@ -813,15 +842,6 @@ bot.on('callback_query', async (query) => {
                 }
                 const response = await res.json();
 
-                let priceData = null;
-                if (response.url) {
-                    priceData = await getCheapestTicketPrice(response.url).catch(error => {
-                        console.error(`Error fetching ticket price for event ${eventId}:`, error.message);
-                        return null;
-                    });
-                }
-                response.cheapestPrice = priceData;
-
                 // Cache the event
                 db.data.eventCache[eventId] = response;
                 await db.write();
@@ -844,7 +864,7 @@ bot.on('callback_query', async (query) => {
             caption += html`🎤 <b>Performing</b>: ${formatted.attractions}\n`;
             caption += html`📅 <b>Date</b>: ${formatted.date}\n`;
             caption += html`🏟 <b>Venue</b>: ${formatted.venue}, ${formatted.city}\n`;
-            caption += html`💵 <b>Cheapest Ticket</b>: ${formatted.price}\n`;
+            caption += html`💵 <b>Price</b>: ${formatted.price}\n`;
             caption += html`🏷 <b>Tags</b>: ${formatted.tags}\n`;
             caption += html`\n📝 <b>Info</b>: ${infoText}\n`;
             caption += html`⚠ <b>Please Note</b>: ${pleaseNoteText}`;

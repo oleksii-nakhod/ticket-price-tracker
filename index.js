@@ -18,7 +18,7 @@ const defaultData = {
     eventCache: {},
     tmptCookies: {}, // site ('ticketmaster.ca' / 'ticketmaster.com') -> { value, timestamp }
     trackedTickets: {}, // chatId -> eventId -> { targetPrice, quantity, lastPrice, lastCheckedAt, alertedPrice }
-    trackerHealth: { failedCycles: 0, failingSince: null, lastError: null, notifiedAt: null }
+    trackerHealth: {} // chatId -> { failedCycles, failingSince, lastError, notifiedAt }, only while its checks fail
 };
 const db = new Low(adapter, defaultData);
 
@@ -33,8 +33,29 @@ db.data.awaitingCity = db.data.awaitingCity || {};
 db.data.eventCache = db.data.eventCache || {};
 db.data.tmptCookies = db.data.tmptCookies || {};
 db.data.trackedTickets = db.data.trackedTickets || {};
-db.data.trackerHealth = db.data.trackerHealth || { ...defaultData.trackerHealth };
+db.data.trackerHealth = db.data.trackerHealth || {};
 delete db.data.tmptCookie; // replaced by per-site tmptCookies
+
+// Tracker health used to be one record shared by all chats, and every chat with tracked tickets was notified
+if ('failedCycles' in db.data.trackerHealth) {
+    const shared = db.data.trackerHealth;
+    db.data.trackerHealth = {};
+    if (shared.failedCycles > 0) {
+        for (const [chatId, tickets] of Object.entries(db.data.trackedTickets)) {
+            if (Object.keys(tickets).length > 0) {
+                db.data.trackerHealth[chatId] = { ...shared };
+            }
+        }
+    }
+}
+
+// Discovery API error responses (e.g. for a removed event) used to be cached as events
+const trackedEventIds = new Set(Object.values(db.data.trackedTickets).flatMap(Object.keys));
+for (const [eventId, event] of Object.entries(db.data.eventCache)) {
+    if (event.errors && !trackedEventIds.has(eventId)) {
+        delete db.data.eventCache[eventId];
+    }
+}
 
 // Tracked tickets used to store only the target price
 for (const tickets of Object.values(db.data.trackedTickets)) {
@@ -67,6 +88,15 @@ class TicketmasterBlockedError extends Error {}
 function ticketmasterSite(eventUrl) {
     const site = new URL(eventUrl).hostname.replace(/^www\./, '');
     return ['ticketmaster.ca', 'ticketmaster.com'].includes(site) ? site : null;
+}
+
+// Whether getCheapestTicketPrice can price this event; ones sold elsewhere (TicketWeb, AXS, ...) can't be tracked
+function canCheckPrice(event) {
+    try {
+        return Boolean(event?.url && ticketmasterSite(event.url));
+    } catch {
+        return false; // malformed URL
+    }
 }
 
 // Function to fetch tmpt cookie by loading an event page of the given site
@@ -152,21 +182,26 @@ async function checkTrackedTickets() {
     if (isCheckingTickets) return;
     isCheckingTickets = true;
 
-    let attempted = 0;
-    const failedEvents = [];
-    let lastError = null;
-    const blockedSites = new Set();
+    // Once a site blocks us, don't keep hammering it for the rest of this cycle
+    const blockedSites = new Map(); // site -> TicketmasterBlockedError
 
     try {
         for (const [chatId, tickets] of Object.entries(db.data.trackedTickets)) {
+            // Each chat is only told about its own events
+            let attempted = 0;
+            const failedEvents = [];
+            let lastError = null;
+
             for (const [eventId, ticket] of Object.entries(tickets)) {
                 const event = db.data.eventCache[eventId];
-                if (!event?.url) continue;
+                // Not a failure: it could never be checked, and /tracked says so
+                if (!canCheckPrice(event)) continue;
                 attempted++;
 
-                // Once a site blocks us, don't keep hammering it for the rest of this cycle
-                if (blockedSites.has(ticketmasterSite(event.url))) {
+                const blockedError = blockedSites.get(ticketmasterSite(event.url));
+                if (blockedError) {
                     failedEvents.push(event);
+                    lastError = blockedError;
                     continue;
                 }
 
@@ -180,7 +215,7 @@ async function checkTrackedTickets() {
                     failedEvents.push(event);
                     lastError = error;
                     if (error instanceof TicketmasterBlockedError) {
-                        blockedSites.add(ticketmasterSite(event.url));
+                        blockedSites.set(ticketmasterSite(event.url), error);
                     }
                     continue;
                 }
@@ -201,11 +236,11 @@ async function checkTrackedTickets() {
                 }
                 await db.write();
             }
-        }
 
-        if (attempted > 0) {
-            console.log(`[Tracker] Completed checking ${attempted} tracked tickets (${failedEvents.length} failed).`);
-            await updateTrackerHealth(attempted, failedEvents, lastError);
+            if (attempted > 0) {
+                console.log(`[Tracker] Completed checking ${attempted} tracked tickets for chat ${chatId} (${failedEvents.length} failed).`);
+                await updateTrackerHealth(chatId, attempted, failedEvents, lastError);
+            }
         }
     } catch (error) {
         console.error('[Tracker] Unexpected error during check:', error);
@@ -218,8 +253,8 @@ async function sendPriceAlert(chatId, event, ticket, priceData) {
     const price = `${priceData.currency} ${priceData.price.toFixed(2)}`;
     const target = `$${ticket.targetPrice.toFixed(2)}`;
     const text = ticket.quantity === 1
-        ? `🎉 *${event.name}* - Price Alert!\n\nThe cheapest ticket is now *${price}* (Section: ${priceData.section}), which is below your target of *${target}*!`
-        : `🎉 *${event.name}* - Price Alert!\n\nThe cheapest price for ${ticket.quantity} tickets is now *${price} each* (${priceData.currency} ${(priceData.price * ticket.quantity).toFixed(2)} total, Section: ${priceData.section}), which is below your target of *${target}* per ticket!`;
+        ? html`🎉 <b>${event.name}</b> - Price Alert!\n\nThe cheapest ticket is now <b>${price}</b> (Section: ${priceData.section}), which is below your target of <b>${target}</b>!`
+        : html`🎉 <b>${event.name}</b> - Price Alert!\n\nThe cheapest price for ${ticket.quantity} tickets is now <b>${price} each</b> (${priceData.currency} ${(priceData.price * ticket.quantity).toFixed(2)} total, Section: ${priceData.section}), which is below your target of <b>${target}</b> per ticket!`;
     const keyboard = {
         inline_keyboard: [
             [
@@ -229,7 +264,7 @@ async function sendPriceAlert(chatId, event, ticket, priceData) {
     };
 
     try {
-        await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard });
+        await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: keyboard });
         return true;
     } catch (error) {
         console.error(`[Tracker] Failed to send price alert to ${chatId}:`, error.message);
@@ -237,37 +272,32 @@ async function sendPriceAlert(chatId, event, ticket, priceData) {
     }
 }
 
-// Plain text on purpose: error messages could break Markdown parsing and the notice would be lost
-async function notifyChats(chatIds, text) {
-    let sent = 0;
-    for (const chatId of chatIds) {
-        try {
-            await bot.sendMessage(chatId, text);
-            sent++;
-        } catch (error) {
-            console.error(`Failed to notify ${chatId}:`, error.message);
-        }
+// Plain text on purpose: error messages could break HTML parsing and the notice would be lost
+async function notifyChat(chatId, text) {
+    try {
+        await bot.sendMessage(chatId, text);
+        return true;
+    } catch (error) {
+        console.error(`Failed to notify ${chatId}:`, error.message);
+        return false;
     }
-    return sent;
 }
 
-// Tell users when price checks start failing (e.g. Ticketmaster blocks this server) and when they recover
-async function updateTrackerHealth(attempted, failedEvents, lastError) {
-    const health = db.data.trackerHealth;
-    const chatIds = Object.keys(db.data.trackedTickets)
-        .filter(chatId => Object.keys(db.data.trackedTickets[chatId]).length > 0);
-
+// Tell a chat when price checks for its events start failing (e.g. Ticketmaster blocks this server) and when they recover
+async function updateTrackerHealth(chatId, attempted, failedEvents, lastError) {
     if (failedEvents.length === 0) {
-        if (health.notifiedAt) {
-            await notifyChats(chatIds, '✅ Ticket price checks are working again. Price alerts are back on.');
+        if (db.data.trackerHealth[chatId]?.notifiedAt) {
+            await notifyChat(chatId, '✅ Ticket price checks are working again. Price alerts are back on.');
         }
-        if (health.failedCycles > 0) {
-            db.data.trackerHealth = { ...defaultData.trackerHealth };
+        if (db.data.trackerHealth[chatId]) {
+            delete db.data.trackerHealth[chatId];
             await db.write();
         }
         return;
     }
 
+    const health = db.data.trackerHealth[chatId] = db.data.trackerHealth[chatId] ||
+        { failedCycles: 0, failingSince: null, lastError: null, notifiedAt: null };
     health.failedCycles++;
     health.failingSince = health.failingSince || Date.now();
     health.lastError = lastError.message;
@@ -275,17 +305,17 @@ async function updateTrackerHealth(attempted, failedEvents, lastError) {
     const reminderDue = !health.notifiedAt || Date.now() - health.notifiedAt >= HEALTH_REMINDER_MS;
     if (health.failedCycles >= HEALTH_ALERT_AFTER_FAILED_CYCLES && reminderDue) {
         const scope = failedEvents.length === attempted
-            ? `all ${attempted} tracked events`
-            : `${failedEvents.length} of ${attempted} tracked events:\n` +
+            ? `all ${attempted} of your tracked events`
+            : `${failedEvents.length} of your ${attempted} tracked events:\n` +
               failedEvents.map(event => `• ${event.name} (${event.dates?.start?.localDate || 'date TBD'})`).join('\n');
         const reason = lastError instanceof TicketmasterBlockedError
             ? `Ticketmaster is blocking requests from this server.\n${lastError.message}`
             : `Last error: ${lastError.message}`;
 
-        const sent = await notifyChats(chatIds,
+        const sent = await notifyChat(chatId,
             `⚠️ Ticket price checks are failing for ${scope}\n\nFailing since ${new Date(health.failingSince).toUTCString()}.\n${reason}\n\nYou won't get price alerts for these events until this is fixed.`
         );
-        if (sent > 0) {
+        if (sent) {
             health.notifiedAt = Date.now();
         }
     }
@@ -395,8 +425,19 @@ function quantityButtons(eventId, selected) {
     }));
 }
 
+// Template tag for messages sent with parse_mode 'HTML': interpolated values are escaped,
+// so event text (names, sections, notes) can't break Telegram's parsing and lose the message
+function html(strings, ...values) {
+    return strings.reduce((result, string, i) => result + escapeHtml(values[i - 1]) + string);
+}
+
+function escapeHtml(value) {
+    return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 // Latest price the tracker saw for this ticket's quantity
-function formatTrackedPrice(ticket) {
+function formatTrackedPrice(event, ticket) {
+    if (!canCheckPrice(event)) return 'Can\'t be checked (only events sold on Ticketmaster can be tracked)';
     if (ticket.lastPrice === undefined) return 'Not checked yet';
     if (ticket.lastPrice === null) return `No tickets available for ${ticket.quantity}`;
     const { price, currency, section } = ticket.lastPrice;
@@ -405,13 +446,13 @@ function formatTrackedPrice(ticket) {
 
 function buildManageMessage(eventId, event, ticket) {
     const formatted = formatEvent(event);
-    let message = `⚙️ *Managing Tracked Ticket:*\n\n`;
-    message += `*${formatted.name}*\n`;
-    message += `📅 *Date*: ${formatted.date}\n`;
-    message += `🏟 *Venue*: ${formatted.venue}, ${formatted.city}\n`;
-    message += `🎟 *Tickets*: ${ticket.quantity}\n`;
-    message += `💵 *Current Price*: ${formatTrackedPrice(ticket)}\n`;
-    message += `🎯 *Current Target*: $${ticket.targetPrice.toFixed(2)}${ticket.quantity > 1 ? ' each' : ''}\n`;
+    let message = `⚙️ <b>Managing Tracked Ticket:</b>\n\n`;
+    message += html`<b>${formatted.name}</b>\n`;
+    message += html`📅 <b>Date</b>: ${formatted.date}\n`;
+    message += html`🏟 <b>Venue</b>: ${formatted.venue}, ${formatted.city}\n`;
+    message += html`🎟 <b>Tickets</b>: ${ticket.quantity}\n`;
+    message += html`💵 <b>Current Price</b>: ${formatTrackedPrice(event, ticket)}\n`;
+    message += html`🎯 <b>Current Target</b>: $${ticket.targetPrice.toFixed(2)}${ticket.quantity > 1 ? ' each' : ''}\n`;
 
     const keyboard = {
         inline_keyboard: [
@@ -511,8 +552,8 @@ bot.onText(/\/tracked/, async (msg) => {
         return;
     }
 
-    let message = '*Your Tracked Tickets:*\n\n';
-    if (db.data.trackerHealth.failedCycles >= HEALTH_ALERT_AFTER_FAILED_CYCLES) {
+    let message = '<b>Your Tracked Tickets:</b>\n\n';
+    if (db.data.trackerHealth[chatId]?.failedCycles >= HEALTH_ALERT_AFTER_FAILED_CYCLES) {
         message += '⚠️ Price checks are currently failing, so prices below may be out of date.\n\n';
     }
     let index = 1;
@@ -524,11 +565,11 @@ bot.onText(/\/tracked/, async (msg) => {
         if (!event) continue;
 
         const formatted = formatEvent(event);
-        message += `${index}. *${formatted.name}*\n`;
-        message += `   📅 *Date*: ${formatted.date}\n`;
-        message += `   🎟 *Tickets*: ${ticket.quantity}\n`;
-        message += `   💵 *Current Price*: ${formatTrackedPrice(ticket)}\n`;
-        message += `   🎯 *Target Price*: $${ticket.targetPrice.toFixed(2)}${ticket.quantity > 1 ? ' each' : ''}\n\n`;
+        message += html`${index}. <b>${formatted.name}</b>\n`;
+        message += html`   📅 <b>Date</b>: ${formatted.date}\n`;
+        message += html`   🎟 <b>Tickets</b>: ${ticket.quantity}\n`;
+        message += html`   💵 <b>Current Price</b>: ${formatTrackedPrice(event, ticket)}\n`;
+        message += html`   🎯 <b>Target Price</b>: $${ticket.targetPrice.toFixed(2)}${ticket.quantity > 1 ? ' each' : ''}\n\n`;
         
         row.push({ text: `Manage ${index}`, callback_data: `manage_${eventId}` });
         if (row.length === 3) {
@@ -542,7 +583,7 @@ bot.onText(/\/tracked/, async (msg) => {
         keyboard.inline_keyboard.push(row);
     }
 
-    bot.sendMessage(chatId, message, { parse_mode: 'Markdown', reply_markup: keyboard });
+    bot.sendMessage(chatId, message, { parse_mode: 'HTML', reply_markup: keyboard });
 });
 
 // Handle /setcity with city name
@@ -631,8 +672,8 @@ bot.on('message', async (msg) => {
         await db.write();
 
         const actionText = isUpdate ? 'Target price updated for' : 'Now tracking';
-        bot.sendMessage(chatId, `${actionText} *${event.name}*. You'll be notified when the price drops to ${price.toFixed(2)} or below per ticket.\n\nHow many tickets do you need?`, {
-            parse_mode: 'Markdown',
+        bot.sendMessage(chatId, html`${actionText} <b>${event.name}</b>. You'll be notified when the price drops to ${price.toFixed(2)} or below per ticket.\n\nHow many tickets do you need?`, {
+            parse_mode: 'HTML',
             reply_markup: { inline_keyboard: [quantityButtons(eventId, quantity)] }
         });
         return;
@@ -676,7 +717,7 @@ bot.on('message', async (msg) => {
             return;
         }
 
-        let message = '🎉 *Events found:*\n\n';
+        let message = '🎉 <b>Events found:</b>\n\n';
         const keyboard = { inline_keyboard: [] };
         
         // Filter out cancelled events and limit to 10
@@ -713,7 +754,7 @@ bot.on('message', async (msg) => {
 
         validEvents.forEach((event, index) => {
             const formatted = formatEvent(event);
-            message += `${index + 1}. *${formatted.name}*\n\n    🎤 *Performing*: ${formatted.attractions}\n    📅 *Date*: ${formatted.date}\n    🏟 *Venue*: ${formatted.venue}, ${formatted.city}\n    💵 *Cheapest Ticket*: ${formatted.price}\n    🏷 *Tags*: ${formatted.tags}\n\n`;
+            message += html`${index + 1}. <b>${formatted.name}</b>\n\n    🎤 <b>Performing</b>: ${formatted.attractions}\n    📅 <b>Date</b>: ${formatted.date}\n    🏟 <b>Venue</b>: ${formatted.venue}, ${formatted.city}\n    💵 <b>Cheapest Ticket</b>: ${formatted.price}\n    🏷 <b>Tags</b>: ${formatted.tags}\n\n`;
             keyboard.inline_keyboard.push([{ text: `${index + 1}. ${formatted.name} - ${formatted.date} - ${formatted.price}`, callback_data: `view_${event.id}` }]);
         });
 
@@ -722,7 +763,7 @@ bot.on('message', async (msg) => {
         if (firstEventImage && message.length <= 950) {
             await bot.sendPhoto(chatId, firstEventImage, {
                 caption: message,
-                parse_mode: 'Markdown',
+                parse_mode: 'HTML',
                 reply_markup: keyboard
             });
         } else {
@@ -734,7 +775,7 @@ bot.on('message', async (msg) => {
                 }
             }
             await bot.sendMessage(chatId, message, {
-                parse_mode: 'Markdown',
+                parse_mode: 'HTML',
                 reply_markup: keyboard
             });
         }
@@ -758,9 +799,19 @@ bot.on('callback_query', async (query) => {
 
             if (!event) {
                 // Fallback to API if not in cache
-                const response = await fetch(
+                const res = await fetch(
                     `https://app.ticketmaster.com/discovery/v2/events/${eventId}?apikey=${ticketmasterApiKey}`
-                ).then(response => response.json());
+                );
+                // Don't cache the error response as if it were the event
+                if (res.status === 404) {
+                    bot.sendMessage(chatId, 'Sorry, this event is no longer available on Ticketmaster.');
+                    bot.answerCallbackQuery(query.id);
+                    return;
+                }
+                if (!res.ok) {
+                    throw new Error(`Discovery API returned status ${res.status} for event ${eventId}`);
+                }
+                const response = await res.json();
 
                 let priceData = null;
                 if (response.url) {
@@ -789,43 +840,44 @@ bot.on('callback_query', async (query) => {
                 pleaseNoteText = pleaseNoteText.substring(0, 150) + '...';
             }
 
-            let caption = `*${formatted.name}*\n\n`;
-            caption += `🎤 *Performing*: ${formatted.attractions}\n`;
-            caption += `📅 *Date*: ${formatted.date}\n`;
-            caption += `🏟 *Venue*: ${formatted.venue}, ${formatted.city}\n`;
-            caption += `💵 *Cheapest Ticket*: ${formatted.price}\n`;
-            caption += `🏷 *Tags*: ${formatted.tags}\n`;
-            caption += `\n📝 *Info*: ${infoText}\n`;
-            caption += `⚠ *Please Note*: ${pleaseNoteText}`;
-
-            const MAX_CAPTION_LENGTH = 950;
-            if (caption.length > MAX_CAPTION_LENGTH) {
-                caption = caption.substring(0, MAX_CAPTION_LENGTH);
-                const asteriskCount = (caption.match(/\*/g) || []).length;
-                if (asteriskCount % 2 !== 0) {
-                    caption += '*';
-                }
-                caption += '... (truncated)';
-            }
+            let caption = html`<b>${formatted.name}</b>\n\n`;
+            caption += html`🎤 <b>Performing</b>: ${formatted.attractions}\n`;
+            caption += html`📅 <b>Date</b>: ${formatted.date}\n`;
+            caption += html`🏟 <b>Venue</b>: ${formatted.venue}, ${formatted.city}\n`;
+            caption += html`💵 <b>Cheapest Ticket</b>: ${formatted.price}\n`;
+            caption += html`🏷 <b>Tags</b>: ${formatted.tags}\n`;
+            caption += html`\n📝 <b>Info</b>: ${infoText}\n`;
+            caption += html`⚠ <b>Please Note</b>: ${pleaseNoteText}`;
 
             const keyboard = {
                 inline_keyboard: [
                     [
-                        { text: 'Track Price', callback_data: `track_${eventId}` },
+                        // Events sold elsewhere (TicketWeb, AXS, ...) can't be price checked
+                        ...(canCheckPrice(event) ? [{ text: 'Track Price', callback_data: `track_${eventId}` }] : []),
                         { text: 'Buy Tickets', url: formatted.url }
                     ]
                 ]
             };
 
-            if (formatted.seatmap) {
+            // Photo captions are capped at 1024 characters, and cutting HTML could split a tag,
+            // so a description too long for a caption goes in its own message after the seat map
+            const MAX_CAPTION_LENGTH = 950;
+            if (formatted.seatmap && caption.length <= MAX_CAPTION_LENGTH) {
                 await bot.sendPhoto(chatId, formatted.seatmap, {
                     caption,
-                    parse_mode: 'Markdown',
+                    parse_mode: 'HTML',
                     reply_markup: keyboard
                 });
             } else {
+                if (formatted.seatmap) {
+                    try {
+                        await bot.sendPhoto(chatId, formatted.seatmap);
+                    } catch (photoError) {
+                        console.error('Error sending seat map:', photoError.message);
+                    }
+                }
                 await bot.sendMessage(chatId, caption, {
-                    parse_mode: 'Markdown',
+                    parse_mode: 'HTML',
                     reply_markup: keyboard
                 });
             }
@@ -838,6 +890,14 @@ bot.on('callback_query', async (query) => {
         }
     } else if (data.startsWith('track_')) {
         const eventId = data.substring(data.indexOf('_') + 1);
+        // Messages sent before the Track button was hidden for these events still have it
+        if (!canCheckPrice(db.data.eventCache[eventId])) {
+            bot.answerCallbackQuery(query.id, {
+                text: 'Price tracking only works for events sold on Ticketmaster.',
+                show_alert: true
+            });
+            return;
+        }
         db.data.awaitingPrice = db.data.awaitingPrice || {};
         db.data.awaitingPrice[chatId] = { eventId };
         await db.write();
@@ -858,7 +918,7 @@ bot.on('callback_query', async (query) => {
         }
 
         const { message, keyboard } = buildManageMessage(eventId, event, ticket);
-        bot.sendMessage(chatId, message, { parse_mode: 'Markdown', reply_markup: keyboard });
+        bot.sendMessage(chatId, message, { parse_mode: 'HTML', reply_markup: keyboard });
         bot.answerCallbackQuery(query.id);
     } else if (data.startsWith('qty_')) {
         const [, quantityText, eventId] = data.match(/^qty_(\d+)_(.+)$/);
@@ -882,7 +942,7 @@ bot.on('callback_query', async (query) => {
             try {
                 if (isManageMessage && db.data.eventCache[eventId]) {
                     const { message, keyboard } = buildManageMessage(eventId, db.data.eventCache[eventId], updated);
-                    await bot.editMessageText(message, { ...messageOptions, parse_mode: 'Markdown', reply_markup: keyboard });
+                    await bot.editMessageText(message, { ...messageOptions, parse_mode: 'HTML', reply_markup: keyboard });
                 } else {
                     await bot.editMessageReplyMarkup({ inline_keyboard: [quantityButtons(eventId, quantity)] }, messageOptions);
                 }
@@ -898,8 +958,8 @@ bot.on('callback_query', async (query) => {
         db.data.awaitingPrice[chatId] = { eventId, isUpdate: true };
         await db.write();
 
-        bot.sendMessage(chatId, 'Please enter your *new* target price per ticket for tracking this event:', {
-            parse_mode: 'Markdown',
+        bot.sendMessage(chatId, 'Please enter your <b>new</b> target price per ticket for tracking this event:', {
+            parse_mode: 'HTML',
             reply_markup: { force_reply: true }
         });
         bot.answerCallbackQuery(query.id);
@@ -908,19 +968,23 @@ bot.on('callback_query', async (query) => {
 
         if (db.data.trackedTickets[chatId] && db.data.trackedTickets[chatId][eventId] !== undefined) {
             delete db.data.trackedTickets[chatId][eventId];
+            // Nothing left to check, so no failure or recovery notices either
+            if (Object.keys(db.data.trackedTickets[chatId]).length === 0) {
+                delete db.data.trackerHealth[chatId];
+            }
             await db.write();
 
             const event = db.data.eventCache[eventId];
-            const eventName = event ? event.name : 'Unknown Event';
+            const eventName = event?.name || 'Unknown Event';
 
             try {
-                 await bot.editMessageText(`❌ Stopped tracking *${eventName}*.`, {
+                 await bot.editMessageText(html`❌ Stopped tracking <b>${eventName}</b>.`, {
                      chat_id: chatId,
                      message_id: query.message.message_id,
-                     parse_mode: 'Markdown'
+                     parse_mode: 'HTML'
                  });
             } catch (err) {
-                 bot.sendMessage(chatId, `❌ Stopped tracking *${eventName}*.`, { parse_mode: 'Markdown' });
+                 bot.sendMessage(chatId, html`❌ Stopped tracking <b>${eventName}</b>.`, { parse_mode: 'HTML' });
             }
         }
         

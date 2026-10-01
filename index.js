@@ -16,11 +16,14 @@ const defaultData = {
     userCities: {},
     awaitingCity: {},
     eventCache: {},
-    tmptCookie: { value: null, timestamp: 0 },
-    trackedTickets: {} // Stores only event IDs
+    tmptCookies: {}, // site ('ticketmaster.ca' / 'ticketmaster.com') -> { value, timestamp }
+    trackedTickets: {}, // chatId -> eventId -> { targetPrice, quantity, lastPrice, lastCheckedAt, alertedPrice }
+    trackerHealth: { failedCycles: 0, failingSince: null, lastError: null, notifiedAt: null }
 };
 const db = new Low(adapter, defaultData);
 
+// This process is the only writer, so db.data stays current after this initial read.
+// Re-reading mid-flight would swap db.data out from under in-progress updates.
 await db.read();
 
 // Ensure db.data and its properties are initialized
@@ -28,35 +31,57 @@ db.data = db.data || defaultData;
 db.data.userCities = db.data.userCities || {};
 db.data.awaitingCity = db.data.awaitingCity || {};
 db.data.eventCache = db.data.eventCache || {};
-db.data.tmptCookie = db.data.tmptCookie || { value: null, timestamp: 0 };
+db.data.tmptCookies = db.data.tmptCookies || {};
 db.data.trackedTickets = db.data.trackedTickets || {};
+db.data.trackerHealth = db.data.trackerHealth || { ...defaultData.trackerHealth };
+delete db.data.tmptCookie; // replaced by per-site tmptCookies
+
+// Tracked tickets used to store only the target price
+for (const tickets of Object.values(db.data.trackedTickets)) {
+    for (const [eventId, ticket] of Object.entries(tickets)) {
+        if (typeof ticket === 'number') {
+            tickets[eventId] = { targetPrice: ticket, quantity: 1 };
+        }
+    }
+}
 await db.write();
+
+// A failed Telegram call or browser launch shouldn't take the whole bot down
+process.on('unhandledRejection', (error) => {
+    console.error('Unhandled rejection:', error);
+});
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const ticketmasterApiKey = process.env.TICKETMASTER_API_KEY;
 
-// Function to fetch tmpt cookie
-async function fetchTmptCookie(force = false) {
-    // Check if cookie exists and is not expired
-    const COOKIE_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
-    const currentTime = Date.now();
+const COOKIE_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
+// While Ticketmaster blocks us every request fails, and launching a browser for each one
+// exhausted the container (EAGAIN / launch timeouts), so refetch at most this often per site
+const COOKIE_REFETCH_COOLDOWN_MS = 10 * 60 * 1000;
+const lastCookieFetchAt = {};
+const pendingCookieFetches = {};
 
-    if (!force && db.data.tmptCookie.value &&
-        (currentTime - db.data.tmptCookie.timestamp < COOKIE_EXPIRY_MS)) {
-        return db.data.tmptCookie.value;
-    }
+class TicketmasterBlockedError extends Error {}
 
-    console.log('Fetching fresh tmpt cookie using Playwright...');
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        locale: 'en-US',
-        viewport: { width: 1280, height: 720 },
-    });
-    const page = await context.newPage();
+// Ticketmaster site an event URL belongs to, or null if it's not one we can price
+function ticketmasterSite(eventUrl) {
+    const site = new URL(eventUrl).hostname.replace(/^www\./, '');
+    return ['ticketmaster.ca', 'ticketmaster.com'].includes(site) ? site : null;
+}
+
+// Function to fetch tmpt cookie by loading an event page of the given site
+async function fetchTmptCookie(eventUrl, site) {
+    console.log(`Fetching fresh tmpt cookie for ${site} using Playwright...`);
+    let browser;
 
     try {
-        const eventUrl = 'https://www.ticketmaster.ca/event/1000628FBC992E22';
+        browser = await chromium.launch({ headless: true });
+        const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            locale: 'en-US',
+            viewport: { width: 1280, height: 720 },
+        });
+        const page = await context.newPage();
         await page.goto(eventUrl, { waitUntil: 'domcontentloaded' });
 
         let tmptCookie = null;
@@ -80,7 +105,7 @@ async function fetchTmptCookie(force = false) {
         }
 
         const cookieValue = `${tmptCookie.name}=${tmptCookie.value}`;
-        db.data.tmptCookie = {
+        db.data.tmptCookies[site] = {
             value: cookieValue,
             timestamp: Date.now()
         };
@@ -91,71 +116,180 @@ async function fetchTmptCookie(force = false) {
         console.error('Error fetching tmpt cookie:', error.message);
         return null;
     } finally {
-        await browser.close();
+        await browser?.close().catch(() => {});
     }
 }
 
-// Function to get valid tmpt cookie
-async function getValidTmptCookie(force = false) {
-    return await fetchTmptCookie(force);
+// Function to get valid tmpt cookie for the event's site
+async function getValidTmptCookie(eventUrl, force = false) {
+    const site = ticketmasterSite(eventUrl);
+    const cached = db.data.tmptCookies[site];
+
+    if (!force && cached?.value && (Date.now() - cached.timestamp < COOKIE_EXPIRY_MS)) {
+        return cached.value;
+    }
+    // Concurrent lookups (e.g. a search's parallel price fetches) share one browser launch
+    if (pendingCookieFetches[site]) {
+        return pendingCookieFetches[site];
+    }
+    if (Date.now() - (lastCookieFetchAt[site] || 0) < COOKIE_REFETCH_COOLDOWN_MS) {
+        return cached?.value || null;
+    }
+
+    lastCookieFetchAt[site] = Date.now();
+    pendingCookieFetches[site] = fetchTmptCookie(eventUrl, site)
+        .finally(() => delete pendingCookieFetches[site]);
+    return pendingCookieFetches[site];
 }
 
-// Schedule periodic cookie refresh
-setInterval(async () => {
-    console.log('Checking tmpt cookie...');
-    await fetchTmptCookie();
-}, 60 * 60 * 1000); // Every hour
+const HEALTH_ALERT_AFTER_FAILED_CYCLES = 2; // ~6 minutes, so a single blip doesn't alert
+const HEALTH_REMINDER_MS = 24 * 60 * 60 * 1000;
+let isCheckingTickets = false;
 
 // Function to check tracked tickets
 async function checkTrackedTickets() {
-    await db.read();
-    let totalChecked = 0;
+    // A slow cycle (browser launches, retries) must not overlap the next one
+    if (isCheckingTickets) return;
+    isCheckingTickets = true;
 
-    for (const [chatId, ticketIds] of Object.entries(db.data.trackedTickets)) {
-        for (const [eventId, targetPrice] of Object.entries(ticketIds)) {
-            try {
+    let attempted = 0;
+    const failedEvents = [];
+    let lastError = null;
+    const blockedSites = new Set();
+
+    try {
+        for (const [chatId, tickets] of Object.entries(db.data.trackedTickets)) {
+            for (const [eventId, ticket] of Object.entries(tickets)) {
                 const event = db.data.eventCache[eventId];
-                if (!event) continue;
+                if (!event?.url) continue;
+                attempted++;
 
-                console.log(`[Tracker] Checking price for tracked event: ${event.name} (Target: $${targetPrice})`);
-
-                let priceData = null;
-                if (event.url) {
-                    const eventDiscoveryId = event.url.split('?')[0].split('/').pop();
-                    priceData = await getCheapestTicketPrice(eventDiscoveryId);
-                }
-                
-                totalChecked++;
-
-                if (priceData && priceData.price <= targetPrice && priceData.price < (event.cheapestPrice?.price || Infinity)) {
-                    const keyboard = {
-                        inline_keyboard: [
-                            [
-                                { text: '🎟️ Buy Tickets', url: event.url || 'https://www.ticketmaster.ca' }
-                            ]
-                        ]
-                    };
-                    // Send notification to user
-                    await bot.sendMessage(chatId,
-                        `🎉 *${event.name}* - Price Alert!\n\nThe cheapest ticket is now *${priceData.currency} ${priceData.price.toFixed(2)}* (Section: ${priceData.section}), which is below your target of *$${targetPrice.toFixed(2)}*!`,
-                        { parse_mode: 'Markdown', reply_markup: keyboard }
-                    );
+                // Once a site blocks us, don't keep hammering it for the rest of this cycle
+                if (blockedSites.has(ticketmasterSite(event.url))) {
+                    failedEvents.push(event);
+                    continue;
                 }
 
-                // Update cached price
-                if (priceData) {
-                    db.data.eventCache[eventId].cheapestPrice = priceData;
-                    await db.write();
+                console.log(`[Tracker] Checking price for tracked event: ${event.name} (Target: $${ticket.targetPrice}, Qty: ${ticket.quantity})`);
+
+                let priceData;
+                try {
+                    priceData = await getCheapestTicketPrice(event.url, ticket.quantity);
+                } catch (error) {
+                    console.error(`[Tracker] Error checking price for event ${eventId}:`, error.message);
+                    failedEvents.push(event);
+                    lastError = error;
+                    if (error instanceof TicketmasterBlockedError) {
+                        blockedSites.add(ticketmasterSite(event.url));
+                    }
+                    continue;
                 }
-            } catch (error) {
-                console.error(`[Tracker] Error checking price for event ${eventId}:`, error.message);
+
+                // Untracked, or quantity/target changed, while we were fetching
+                if (db.data.trackedTickets[chatId]?.[eventId] !== ticket) continue;
+
+                ticket.lastPrice = priceData;
+                ticket.lastCheckedAt = Date.now();
+
+                if (!priceData || priceData.price > ticket.targetPrice) {
+                    // Re-arm, so the next dip under the target alerts again
+                    ticket.alertedPrice = null;
+                } else if (ticket.alertedPrice == null || priceData.price < ticket.alertedPrice) {
+                    if (await sendPriceAlert(chatId, event, ticket, priceData)) {
+                        ticket.alertedPrice = priceData.price;
+                    }
+                }
+                await db.write();
             }
         }
+
+        if (attempted > 0) {
+            console.log(`[Tracker] Completed checking ${attempted} tracked tickets (${failedEvents.length} failed).`);
+            await updateTrackerHealth(attempted, failedEvents, lastError);
+        }
+    } catch (error) {
+        console.error('[Tracker] Unexpected error during check:', error);
+    } finally {
+        isCheckingTickets = false;
     }
-    
-    if (totalChecked > 0) {
-        console.log(`[Tracker] Completed checking ${totalChecked} tracked tickets.`);
+}
+
+async function sendPriceAlert(chatId, event, ticket, priceData) {
+    const price = `${priceData.currency} ${priceData.price.toFixed(2)}`;
+    const target = `$${ticket.targetPrice.toFixed(2)}`;
+    const text = ticket.quantity === 1
+        ? `🎉 *${event.name}* - Price Alert!\n\nThe cheapest ticket is now *${price}* (Section: ${priceData.section}), which is below your target of *${target}*!`
+        : `🎉 *${event.name}* - Price Alert!\n\nThe cheapest price for ${ticket.quantity} tickets is now *${price} each* (${priceData.currency} ${(priceData.price * ticket.quantity).toFixed(2)} total, Section: ${priceData.section}), which is below your target of *${target}* per ticket!`;
+    const keyboard = {
+        inline_keyboard: [
+            [
+                { text: '🎟️ Buy Tickets', url: event.url }
+            ]
+        ]
+    };
+
+    try {
+        await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard });
+        return true;
+    } catch (error) {
+        console.error(`[Tracker] Failed to send price alert to ${chatId}:`, error.message);
+        return false;
     }
+}
+
+// Plain text on purpose: error messages could break Markdown parsing and the notice would be lost
+async function notifyChats(chatIds, text) {
+    let sent = 0;
+    for (const chatId of chatIds) {
+        try {
+            await bot.sendMessage(chatId, text);
+            sent++;
+        } catch (error) {
+            console.error(`Failed to notify ${chatId}:`, error.message);
+        }
+    }
+    return sent;
+}
+
+// Tell users when price checks start failing (e.g. Ticketmaster blocks this server) and when they recover
+async function updateTrackerHealth(attempted, failedEvents, lastError) {
+    const health = db.data.trackerHealth;
+    const chatIds = Object.keys(db.data.trackedTickets)
+        .filter(chatId => Object.keys(db.data.trackedTickets[chatId]).length > 0);
+
+    if (failedEvents.length === 0) {
+        if (health.notifiedAt) {
+            await notifyChats(chatIds, '✅ Ticket price checks are working again. Price alerts are back on.');
+        }
+        if (health.failedCycles > 0) {
+            db.data.trackerHealth = { ...defaultData.trackerHealth };
+            await db.write();
+        }
+        return;
+    }
+
+    health.failedCycles++;
+    health.failingSince = health.failingSince || Date.now();
+    health.lastError = lastError.message;
+
+    const reminderDue = !health.notifiedAt || Date.now() - health.notifiedAt >= HEALTH_REMINDER_MS;
+    if (health.failedCycles >= HEALTH_ALERT_AFTER_FAILED_CYCLES && reminderDue) {
+        const scope = failedEvents.length === attempted
+            ? `all ${attempted} tracked events`
+            : `${failedEvents.length} of ${attempted} tracked events:\n` +
+              failedEvents.map(event => `• ${event.name} (${event.dates?.start?.localDate || 'date TBD'})`).join('\n');
+        const reason = lastError instanceof TicketmasterBlockedError
+            ? `Ticketmaster is blocking requests from this server.\n${lastError.message}`
+            : `Last error: ${lastError.message}`;
+
+        const sent = await notifyChats(chatIds,
+            `⚠️ Ticket price checks are failing for ${scope}\n\nFailing since ${new Date(health.failingSince).toUTCString()}.\n${reason}\n\nYou won't get price alerts for these events until this is fixed.`
+        );
+        if (sent > 0) {
+            health.notifiedAt = Date.now();
+        }
+    }
+    await db.write();
 }
 
 // Schedule price checks every 3 minutes
@@ -163,19 +297,27 @@ setInterval(checkTrackedTickets, 3 * 60 * 1000);
 
 const bot = new TelegramBot(token, { polling: true });
 
-// Modified function to fetch cheapest ticket price
-async function getCheapestTicketPrice(eventId, retryCount = 0) {
+// Fetch the cheapest offer that can be bought in the given quantity (price is per ticket).
+// Returns null when no such tickets are available; throws when the price couldn't be checked.
+async function getCheapestTicketPrice(eventUrl, quantity = 1, retryCount = 0) {
+    const site = ticketmasterSite(eventUrl);
+    if (!site) {
+        throw new Error(`Price checks aren't supported for ${new URL(eventUrl).hostname}`);
+    }
+    const eventId = eventUrl.split('?')[0].split('/').pop();
+
     try {
-        const tmptCookie = await getValidTmptCookie();
+        // A retry means the previous response was rejected, so ask for a fresh cookie
+        const tmptCookie = await getValidTmptCookie(eventUrl, retryCount > 0);
         if (!tmptCookie) {
-            console.error('No valid tmpt cookie available');
-            return null;
+            throw new Error(`No valid tmpt cookie available for ${site}`);
         }
 
-        const url = `https://offeradapter.ticketmaster.ca/api/ismds/event/${eventId}/quickpicks?` + new URLSearchParams({
+        // US events are only served by the .com API; the .ca one returns no offers for them
+        const url = `https://offeradapter.${site}/api/ismds/event/${eventId}/quickpicks?` + new URLSearchParams({
             show: 'places+maxQuantity+sections',
             mode: 'primary:ppsectionrow+resale:ga_areas+platinum:all',
-            qty: 1,
+            qty: quantity,
             q: 'not(\'accessible\')',
             embed: 'offer',
             apikey: process.env.TICKETMASTER_PUBLIC_API_KEY,
@@ -187,7 +329,7 @@ async function getCheapestTicketPrice(eventId, retryCount = 0) {
 
         const res = await fetch(url, {
             headers: {
-                'Referer': 'https://www.ticketmaster.ca/',
+                'Referer': `https://www.${site}/`,
                 'TMPS-Correlation-Id': uuidv4(),
                 'Cookie': tmptCookie
             }
@@ -196,12 +338,10 @@ async function getCheapestTicketPrice(eventId, retryCount = 0) {
         if (res.status === 401 || res.status === 403) {
             if (retryCount < 1) {
                 console.log(`Received status ${res.status} for event ${eventId}. Refreshing cookie and retrying...`);
-                await getValidTmptCookie(true);
-                return await getCheapestTicketPrice(eventId, retryCount + 1);
-            } else {
-                console.error(`Received status ${res.status} for event ${eventId} on retry.`);
-                return null;
+                return await getCheapestTicketPrice(eventUrl, quantity, retryCount + 1);
             }
+            const body = await res.text();
+            throw new TicketmasterBlockedError(`Received status ${res.status} for event ${eventId} on retry: ${body.slice(0, 100)}`);
         }
 
         const contentType = res.headers.get('content-type') || '';
@@ -210,41 +350,82 @@ async function getCheapestTicketPrice(eventId, retryCount = 0) {
             if (text.trim().startsWith('<') || res.status !== 200) {
                 if (retryCount < 1) {
                     console.log(`Received HTML/non-JSON response (status ${res.status}) for event ${eventId}. Refreshing cookie and retrying...`);
-                    await getValidTmptCookie(true);
-                    return await getCheapestTicketPrice(eventId, retryCount + 1);
-                } else {
-                    console.error(`Received HTML/non-JSON response (status ${res.status}) for event ${eventId} on retry.`);
-                    return null;
+                    return await getCheapestTicketPrice(eventUrl, quantity, retryCount + 1);
                 }
+                throw new Error(`Received HTML/non-JSON response (status ${res.status}) for event ${eventId} on retry`);
             }
+        }
+
+        if (!res.ok) {
+            throw new Error(`Received status ${res.status} for event ${eventId}`);
         }
 
         const response = await res.json();
         const offers = response._embedded?.offer || [];
 
-        if (offers.length === 0) return null;
-
-        const validOffers = offers.filter(offer => offer.sellableQuantities.includes(1));
+        // Offers that can't be split down to exactly this quantity (e.g. a pair sold together) are excluded
+        const validOffers = offers.filter(offer => offer.sellableQuantities?.includes(quantity));
 
         if (validOffers.length === 0) return null;
 
         const cheapestOffer = validOffers.reduce((min, offer) =>
             (!min || offer.totalPrice < min.totalPrice) ? offer : min, null);
 
-        return cheapestOffer ? {
+        return {
             price: cheapestOffer.totalPrice,
             currency: cheapestOffer.currency,
             section: cheapestOffer.section
-        } : null;
+        };
     } catch (error) {
         if (retryCount < 1 && (error.message.includes('Unexpected token') || error.message.includes('JSON'))) {
             console.log(`JSON parsing failed for event ${eventId}. Refreshing cookie and retrying...`);
-            await getValidTmptCookie(true);
-            return await getCheapestTicketPrice(eventId, retryCount + 1);
+            return await getCheapestTicketPrice(eventUrl, quantity, retryCount + 1);
         }
-        console.error(`Error fetching ticket price for event ${eventId}:`, error.message);
-        return null;
+        throw error;
     }
+}
+
+const QUANTITY_OPTIONS = [1, 2, 3, 4, 5, 6];
+
+// Row of buttons to pick how many tickets to track, current choice checked
+function quantityButtons(eventId, selected) {
+    return QUANTITY_OPTIONS.map(quantity => ({
+        text: quantity === selected ? `✅ ${quantity}` : `${quantity}`,
+        callback_data: `qty_${quantity}_${eventId}`
+    }));
+}
+
+// Latest price the tracker saw for this ticket's quantity
+function formatTrackedPrice(ticket) {
+    if (ticket.lastPrice === undefined) return 'Not checked yet';
+    if (ticket.lastPrice === null) return `No tickets available for ${ticket.quantity}`;
+    const { price, currency, section } = ticket.lastPrice;
+    return `${currency} ${price.toFixed(2)}${ticket.quantity > 1 ? ' each' : ''} (${section})`;
+}
+
+function buildManageMessage(eventId, event, ticket) {
+    const formatted = formatEvent(event);
+    let message = `⚙️ *Managing Tracked Ticket:*\n\n`;
+    message += `*${formatted.name}*\n`;
+    message += `📅 *Date*: ${formatted.date}\n`;
+    message += `🏟 *Venue*: ${formatted.venue}, ${formatted.city}\n`;
+    message += `🎟 *Tickets*: ${ticket.quantity}\n`;
+    message += `💵 *Current Price*: ${formatTrackedPrice(ticket)}\n`;
+    message += `🎯 *Current Target*: $${ticket.targetPrice.toFixed(2)}${ticket.quantity > 1 ? ' each' : ''}\n`;
+
+    const keyboard = {
+        inline_keyboard: [
+            quantityButtons(eventId, ticket.quantity),
+            [
+                { text: '✏️ Adjust Price', callback_data: `editprice_${eventId}` },
+                { text: '❌ Stop Tracking', callback_data: `untrack_${eventId}` }
+            ],
+            [
+                { text: '🎟️ Buy Tickets', url: formatted.url }
+            ]
+        ]
+    };
+    return { message, keyboard };
 }
 
 // Shared function to format event data
@@ -323,7 +504,6 @@ Type any keyword after setting a city to search for events.`);
 // Handle /tracked command
 bot.onText(/\/tracked/, async (msg) => {
     const chatId = msg.chat.id;
-    await db.read();
 
     const trackedTickets = db.data.trackedTickets[chatId] || {};
     if (Object.keys(trackedTickets).length === 0) {
@@ -332,19 +512,23 @@ bot.onText(/\/tracked/, async (msg) => {
     }
 
     let message = '*Your Tracked Tickets:*\n\n';
+    if (db.data.trackerHealth.failedCycles >= HEALTH_ALERT_AFTER_FAILED_CYCLES) {
+        message += '⚠️ Price checks are currently failing, so prices below may be out of date.\n\n';
+    }
     let index = 1;
     const keyboard = { inline_keyboard: [] };
     let row = [];
 
-    for (const [eventId, targetPrice] of Object.entries(trackedTickets)) {
+    for (const [eventId, ticket] of Object.entries(trackedTickets)) {
         const event = db.data.eventCache[eventId];
         if (!event) continue;
 
         const formatted = formatEvent(event);
         message += `${index}. *${formatted.name}*\n`;
         message += `   📅 *Date*: ${formatted.date}\n`;
-        message += `   💵 *Current Price*: ${formatted.price}\n`;
-        message += `   🎯 *Target Price*: $${targetPrice.toFixed(2)}\n\n`;
+        message += `   🎟 *Tickets*: ${ticket.quantity}\n`;
+        message += `   💵 *Current Price*: ${formatTrackedPrice(ticket)}\n`;
+        message += `   🎯 *Target Price*: $${ticket.targetPrice.toFixed(2)}${ticket.quantity > 1 ? ' each' : ''}\n\n`;
         
         row.push({ text: `Manage ${index}`, callback_data: `manage_${eventId}` });
         if (row.length === 3) {
@@ -391,8 +575,7 @@ bot.on('message', async (msg) => {
 
     if (text.startsWith('/')) {
         let stateChanged = false;
-        await db.read();
-        
+
         if (db.data.awaitingCity && db.data.awaitingCity[chatId] && !text.startsWith('/setcity')) {
             db.data.awaitingCity[chatId] = false;
             stateChanged = true;
@@ -409,7 +592,6 @@ bot.on('message', async (msg) => {
         return;
     }
 
-    await db.read();
     db.data.awaitingCity = db.data.awaitingCity || {};
     db.data.eventCache = db.data.eventCache || {};
     db.data.trackedTickets = db.data.trackedTickets || {};
@@ -442,12 +624,17 @@ bot.on('message', async (msg) => {
         }
 
         db.data.trackedTickets[chatId] = db.data.trackedTickets[chatId] || {};
-        db.data.trackedTickets[chatId][eventId] = price;
+        const quantity = db.data.trackedTickets[chatId][eventId]?.quantity || 1;
+        // New object resets the last price/alert state, which were for the old target
+        db.data.trackedTickets[chatId][eventId] = { targetPrice: price, quantity };
         delete db.data.awaitingPrice[chatId];
         await db.write();
 
         const actionText = isUpdate ? 'Target price updated for' : 'Now tracking';
-        bot.sendMessage(chatId, `${actionText} *${event.name}*. You'll be notified when the price drops to ${price.toFixed(2)} or below.`, { parse_mode: 'Markdown' });
+        bot.sendMessage(chatId, `${actionText} *${event.name}*. You'll be notified when the price drops to ${price.toFixed(2)} or below per ticket.\n\nHow many tickets do you need?`, {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [quantityButtons(eventId, quantity)] }
+        });
         return;
     }
 
@@ -506,8 +693,10 @@ bot.on('message', async (msg) => {
         const pricePromises = validEvents.map(async (event) => {
             let priceData = null;
             if (event.url) {
-                const eventDiscoveryId = event.url.split('?')[0].split('/').pop();
-                priceData = await getCheapestTicketPrice(eventDiscoveryId);
+                priceData = await getCheapestTicketPrice(event.url).catch(error => {
+                    console.error(`Error fetching ticket price for event ${event.id}:`, error.message);
+                    return null;
+                });
             }
             event.cheapestPrice = priceData;
 
@@ -565,7 +754,6 @@ bot.on('callback_query', async (query) => {
         const eventId = data.substring(data.indexOf('_') + 1);
 
         try {
-            await db.read();
             let event = db.data.eventCache[eventId];
 
             if (!event) {
@@ -576,8 +764,10 @@ bot.on('callback_query', async (query) => {
 
                 let priceData = null;
                 if (response.url) {
-                    const eventDiscoveryId = response.url.split('?')[0].split('/').pop();
-                    priceData = await getCheapestTicketPrice(eventDiscoveryId);
+                    priceData = await getCheapestTicketPrice(response.url).catch(error => {
+                        console.error(`Error fetching ticket price for event ${eventId}:`, error.message);
+                        return null;
+                    });
                 }
                 response.cheapestPrice = priceData;
 
@@ -652,68 +842,79 @@ bot.on('callback_query', async (query) => {
         db.data.awaitingPrice[chatId] = { eventId };
         await db.write();
 
-        bot.sendMessage(chatId, 'Please enter your target price for tracking this event:', {
+        bot.sendMessage(chatId, 'Please enter your target price per ticket for tracking this event:', {
             reply_markup: { force_reply: true }
         });
         bot.answerCallbackQuery(query.id);
     } else if (data.startsWith('manage_')) {
         const eventId = data.substring(data.indexOf('_') + 1);
-        await db.read();
         const event = db.data.eventCache[eventId];
-        const targetPrice = db.data.trackedTickets[chatId]?.[eventId];
-        
-        if (!event || targetPrice === undefined) {
+        const ticket = db.data.trackedTickets[chatId]?.[eventId];
+
+        if (!event || ticket === undefined) {
             bot.sendMessage(chatId, 'This ticket is no longer being tracked or the event data is missing.');
             bot.answerCallbackQuery(query.id);
             return;
         }
 
-        const formatted = formatEvent(event);
-        let message = `⚙️ *Managing Tracked Ticket:*\n\n`;
-        message += `*${formatted.name}*\n`;
-        message += `📅 *Date*: ${formatted.date}\n`;
-        message += `🏟 *Venue*: ${formatted.venue}, ${formatted.city}\n`;
-        message += `💵 *Current Price*: ${formatted.price}\n`;
-        message += `🎯 *Current Target*: $${targetPrice.toFixed(2)}\n`;
-
-        const keyboard = {
-            inline_keyboard: [
-                [
-                    { text: '✏️ Adjust Price', callback_data: `editprice_${eventId}` },
-                    { text: '❌ Stop Tracking', callback_data: `untrack_${eventId}` }
-                ],
-                [
-                    { text: '🎟️ Buy Tickets', url: formatted.url }
-                ]
-            ]
-        };
-
+        const { message, keyboard } = buildManageMessage(eventId, event, ticket);
         bot.sendMessage(chatId, message, { parse_mode: 'Markdown', reply_markup: keyboard });
         bot.answerCallbackQuery(query.id);
+    } else if (data.startsWith('qty_')) {
+        const [, quantityText, eventId] = data.match(/^qty_(\d+)_(.+)$/);
+        const quantity = Number(quantityText);
+        const ticket = db.data.trackedTickets[chatId]?.[eventId];
+
+        if (!ticket) {
+            bot.answerCallbackQuery(query.id, { text: 'This ticket is no longer being tracked' });
+            return;
+        }
+
+        if (ticket.quantity !== quantity) {
+            // New object resets the last price/alert state, which were for the old quantity
+            const updated = { targetPrice: ticket.targetPrice, quantity };
+            db.data.trackedTickets[chatId][eventId] = updated;
+            await db.write();
+
+            const messageOptions = { chat_id: chatId, message_id: query.message.message_id };
+            const isManageMessage = query.message.reply_markup?.inline_keyboard
+                .some(row => row.some(button => button.callback_data?.startsWith('editprice_')));
+            try {
+                if (isManageMessage && db.data.eventCache[eventId]) {
+                    const { message, keyboard } = buildManageMessage(eventId, db.data.eventCache[eventId], updated);
+                    await bot.editMessageText(message, { ...messageOptions, parse_mode: 'Markdown', reply_markup: keyboard });
+                } else {
+                    await bot.editMessageReplyMarkup({ inline_keyboard: [quantityButtons(eventId, quantity)] }, messageOptions);
+                }
+            } catch (error) {
+                console.error('Error updating quantity buttons:', error.message);
+            }
+        }
+
+        bot.answerCallbackQuery(query.id, { text: `Tracking ${quantity} ticket${quantity > 1 ? 's' : ''}` });
     } else if (data.startsWith('editprice_')) {
         const eventId = data.substring(data.indexOf('_') + 1);
         db.data.awaitingPrice = db.data.awaitingPrice || {};
         db.data.awaitingPrice[chatId] = { eventId, isUpdate: true };
         await db.write();
 
-        bot.sendMessage(chatId, 'Please enter your *new* target price for tracking this event:', { 
+        bot.sendMessage(chatId, 'Please enter your *new* target price per ticket for tracking this event:', {
             parse_mode: 'Markdown',
             reply_markup: { force_reply: true }
         });
         bot.answerCallbackQuery(query.id);
     } else if (data.startsWith('untrack_')) {
         const eventId = data.substring(data.indexOf('_') + 1);
-        await db.read();
-        
+
         if (db.data.trackedTickets[chatId] && db.data.trackedTickets[chatId][eventId] !== undefined) {
             delete db.data.trackedTickets[chatId][eventId];
             await db.write();
-            
+
             const event = db.data.eventCache[eventId];
             const eventName = event ? event.name : 'Unknown Event';
-            
+
             try {
-                 bot.editMessageText(`❌ Stopped tracking *${eventName}*.`, {
+                 await bot.editMessageText(`❌ Stopped tracking *${eventName}*.`, {
                      chat_id: chatId,
                      message_id: query.message.message_id,
                      parse_mode: 'Markdown'
@@ -731,10 +932,9 @@ bot.on('polling_error', (error) => {
     console.error('Polling error:', error);
 });
 
-// Initial cookie fetch and price check on startup
+// Initial price check on startup (cookies are fetched per site as needed)
 (async () => {
     try {
-        await fetchTmptCookie();
         await checkTrackedTickets();
         console.log('Bot is running...');
     } catch (error) {
